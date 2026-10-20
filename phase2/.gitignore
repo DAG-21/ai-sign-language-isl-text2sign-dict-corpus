@@ -14,3 +14,9 @@ node_modules
 .next/
 *.tsbuildinfo
 .DS_Store
+
+# derived landmark/bone tracks from ISLRTC clips (experiment output; not for redistribution)
+public/lab/
+
+# on-demand H.264 copies of dictionary clips (derived data)
+.cache/

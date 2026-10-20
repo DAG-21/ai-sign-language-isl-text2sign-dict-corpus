@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev:islrtc": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-islrtc.ps1"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
@@ -32,7 +35,8 @@
     "@types/three": "^0.185.4",
     "postcss": "^8.5",
     "tailwindcss": "^4.3.3",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "vitest": "^3.2.7"
   },
   "pnpm": {
     "overrides": {
