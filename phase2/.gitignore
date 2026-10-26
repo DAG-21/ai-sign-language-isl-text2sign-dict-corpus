@@ -1,0 +1,32 @@
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+
+# Environment variables
+.env*.local
+
+# Common ignores
+node_modules
+.next/
+*.tsbuildinfo
+.DS_Store
+
+# derived landmark/bone tracks from ISLRTC clips (experiment output; not for redistribution)
+public/lab/
+
+# on-demand H.264 copies of dictionary clips (derived data)
+.cache/
+
+# manifest and mappings derived from the ISLRTC dictionary (not for redistribution)
+data/islrtc/
+
+# batch landmark/avatar-track output (derived from ISLRTC clips; large, not for redistribution)
+data/pose/
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -1,0 +1,481 @@
+'use client'
+
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { AvatarPlayer } from '@/components/avatar/AvatarPlayer'
+import {
+  translateToGloss,
+  translateOffline,
+  TranslationAbortedError,
+  type TranslationMode,
+} from '@/lib/islTranslator'
+import {
+  ArrowDownRight,
+  ArrowRight,
+  AudioLines,
+  ChevronLeft,
+  ChevronRight,
+  Globe2,
+  Hand,
+  LayoutDashboard,
+  LogOut,
+  Maximize2,
+  Menu,
+  Mic,
+  Minimize2,
+  Move3d,
+  Play,
+  Square,
+  Sparkles,
+  MicOff,
+  LogIn,
+  UserPlus,
+  UserRound,
+  X,
+} from 'lucide-react'
+
+type SpeechRecognitionResult = ArrayLike<{ transcript: string }> & { isFinal?: boolean }
+type SpeechRecognitionConstructor = new () => {
+  continuous: boolean
+  interimResults: boolean
+  lang: string
+  onstart: (() => void) | null
+  onend: (() => void) | null
+  onerror: (() => void) | null
+  onresult: ((event: { resultIndex: number; results: ArrayLike<SpeechRecognitionResult> }) => void) | null
+  start: () => void
+  stop: () => void
+  abort: () => void
+}
+
+type LocalAccount = { name: string; email: string }
+
+const team = [
+  { name: 'Mitarth Pathak', role: 'Engineering, UI & 3D', image: null, linkedin: 'https://www.linkedin.com/in/mitarth-pathak/' },
+  { name: 'Navneet Singh', role: 'Technology & AI', image: null, linkedin: 'https://www.linkedin.com/in/navneet-singh99/' },
+  { name: 'Gaurav Soni', role: 'Design & Experience', image: null },
+  { name: 'Deep Panchal', role: 'Product & Vision', image: null, linkedin: 'https://www.linkedin.com/in/deep-panchal-3a1474399/' },
+  { name: 'Nooren Qureshi', role: 'Research & Community', image: null, linkedin: 'https://www.linkedin.com/in/nooren-qureshi-803a27381/' },
+]
+
+const features = [
+  { icon: Mic, title: 'Speak naturally', text: 'Yap captures the rhythm, intent, and nuance of everyday speech.' },
+  { icon: Move3d, title: 'See every sign', text: 'Render turns language into expressive Indian Sign Language in real time.' },
+  { icon: Globe2, title: 'Reach more people', text: 'Make classrooms, clinics, and conversations feel open to everyone.' },
+]
+
+const quickPhrases = ['YOU', 'HOME', 'TIME', 'PERSON', 'HELLO', 'HELP', 'THANK YOU', 'YES', 'NO', 'PLEASE', 'SORRY', 'WELCOME', 'GOOD', 'BAD', 'STOP', 'WAIT', 'COME', 'GO', 'WANT', 'NEED', 'LIKE', 'KNOW', 'UNDERSTAND', 'ASK', 'DRINK', 'EAT', 'WATER', 'GIVE', 'TAKE', 'SHOW', 'LOOK', 'SEE', 'LISTEN', 'TALK', 'START', 'FINISH', 'AGAIN', 'SLEEP', 'TOILET', 'DOCTOR', 'HOSPITAL', 'PAIN', 'SCHOOL', 'CLASS', 'TEACHER', 'STUDENT', 'BOOK', 'I', 'MY', 'YOUR', 'MORNING', 'LOVE', 'MEET', 'NAME']
+
+export default function Page() {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [translation, setTranslation] = useState('YOU HOME')
+  const [avatarPhrase, setAvatarPhrase] = useState('YOU HOME')
+  const [avatarModel, setAvatarModel] = useState<'default' | 'human'>('default')
+  const [requestId, setRequestId] = useState(0)
+  const [stopId, setStopId] = useState(0)
+  const [resetId, setResetId] = useState(0)
+  const [speed, setSpeed] = useState(1)
+  const [avatarState, setAvatarState] = useState<'loading' | 'ready' | 'signing'>('loading')
+  const [isTranslating, setIsTranslating] = useState(false)
+  const [translationMode, setTranslationMode] = useState<TranslationMode>('online')
+  const [translationEngine, setTranslationEngine] = useState<TranslationMode>('online')
+  const [speechSupported, setSpeechSupported] = useState(false)
+  const [isListening, setIsListening] = useState(false)
+  const [liveMode, setLiveMode] = useState(false)
+  const [authOpen, setAuthOpen] = useState(false)
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin')
+  const [account, setAccount] = useState<LocalAccount | null>(null)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+  const [dashboardOpen, setDashboardOpen] = useState(false)
+  const [isMaximized, setIsMaximized] = useState(false)
+  const [aboutOpen, setAboutOpen] = useState(false)
+  const recognitionRef = useRef<InstanceType<SpeechRecognitionConstructor> | null>(null)
+  const liveModeRef = useRef(false)
+  const quickPhrasesRef = useRef<HTMLDivElement>(null)
+  const translateAbortRef = useRef<AbortController | null>(null)
+  const translationEngineRef = useRef<TranslationMode>('online')
+  // Live streaming state: how many transcript words have already been handed to
+  // the avatar, and a promise chain that keeps chunk translations in spoken
+  // order even when the AI call for one chunk is slower than the next.
+  const liveCommittedRef = useRef(0)
+  const liveChainRef = useRef<Promise<void>>(Promise.resolve())
+
+  // Hybrid translation trigger: resolve raw input to ISL gloss (Gemini when
+  // the engine toggle is "online", rule-based engine otherwise / on failure)
+  // and only then hand the clean gloss string to the avatar. A newer call
+  // aborts the previous fetch so fast typing and live speech never race.
+  const dispatchTranslation = useCallback(async (rawText: string, options?: { append?: boolean }) => {
+    const text = rawText.trim()
+    if (!text) return
+
+    // Live streaming path: each word-chunk is queued behind the previous one so
+    // signs play in spoken order. This always uses the instant offline engine
+    // — a Gemini round trip per word is exactly the multi-second stall live
+    // mode exists to avoid. The AI engine still applies to typed/Enter runs.
+    if (options?.append) {
+      liveChainRef.current = liveChainRef.current.catch(() => {}).then(() => {
+        if (!liveModeRef.current) return
+        const result = translateOffline(text)
+        setTranslationMode(result.mode)
+        setAvatarPhrase(result.glossText || text)
+        setRequestId((current) => current + 1)
+      })
+      return
+    }
+
+    translateAbortRef.current?.abort()
+    translateAbortRef.current = null
+
+    // Forced offline: skip the network entirely, resolve synchronously.
+    if (translationEngineRef.current === 'offline') {
+      const result = translateOffline(text)
+      setTranslationMode(result.mode)
+      setAvatarPhrase(result.glossText || text)
+      setRequestId((current) => current + 1)
+      return
+    }
+
+    const controller = new AbortController()
+    translateAbortRef.current = controller
+    setIsTranslating(true)
+
+    try {
+      const result = await translateToGloss(text, controller.signal)
+      if (controller.signal.aborted) return
+      setTranslationMode(result.mode)
+      setAvatarPhrase(result.glossText || text)
+      setRequestId((current) => current + 1)
+    } catch (error) {
+      if (!(error instanceof TranslationAbortedError)) {
+        console.warn('[ISL] translation dispatch failed:', error)
+      }
+    } finally {
+      if (translateAbortRef.current === controller) {
+        translateAbortRef.current = null
+        setIsTranslating(false)
+      }
+    }
+  }, [])
+
+  const chooseTranslationEngine = (engine: TranslationMode) => {
+    translationEngineRef.current = engine
+    setTranslationEngine(engine)
+    if (engine === 'offline') {
+      translateAbortRef.current?.abort()
+      translateAbortRef.current = null
+      setIsTranslating(false)
+    }
+    // Reset the resolved-mode indicator optimistically; the next translation
+    // corrects it to "AI unavailable" if the online call has to fall back.
+    setTranslationMode(engine)
+  }
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => entries.forEach((entry) => entry.isIntersecting && entry.target.classList.add('is-visible')),
+      { threshold: 0.14 },
+    )
+    document.querySelectorAll('.reveal').forEach((element) => observer.observe(element))
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const savedAccount = window.localStorage.getItem('yap-render-account')
+    if (savedAccount) setAccount(JSON.parse(savedAccount) as LocalAccount)
+  }, [])
+
+  useEffect(() => {
+    if (!aboutOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => event.key === 'Escape' && setAboutOpen(false)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [aboutOpen])
+
+  useEffect(() => {
+    const speechWindow = window as typeof window & {
+      SpeechRecognition?: SpeechRecognitionConstructor
+      webkitSpeechRecognition?: SpeechRecognitionConstructor
+    }
+    const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition
+    if (!SpeechRecognition) return
+
+    setSpeechSupported(true)
+    const recognition = new SpeechRecognition()
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = 'en-IN'
+    recognition.onstart = () => {
+      setIsListening(true)
+      // A fresh recognition session restarts `event.results` from index 0.
+      liveCommittedRef.current = 0
+    }
+    recognition.onend = () => {
+      setIsListening(false)
+      if (liveModeRef.current) window.setTimeout(() => {
+        try { recognition.start() } catch { /* The recognizer is already restarting. */ }
+      }, 220)
+    }
+    recognition.onerror = () => setIsListening(false)
+    recognition.onresult = (event) => {
+      let transcript = ''
+      for (let index = 0; index < event.results.length; index += 1) transcript += event.results[index][0]?.transcript || ''
+      transcript = transcript.trim()
+      setTranslation(transcript)
+      if (!liveModeRef.current) return
+
+      // Don't wait for the speaker to stop, and don't wait for a batch either.
+      // The instant a fresh word lands on the interim transcript, translate it
+      // and let the avatar queue it, so the first word replaces the idle
+      // "YOU HOME" pose immediately instead of sitting in a buffer.
+      const words = transcript ? transcript.split(/\s+/) : []
+      const pending = words.length - liveCommittedRef.current
+      if (pending <= 0) return
+
+      const chunk = words.slice(liveCommittedRef.current).join(' ')
+      liveCommittedRef.current = words.length
+      void dispatchTranslation(chunk, { append: true })
+    }
+    recognitionRef.current = recognition
+
+    return () => {
+      recognition.abort()
+      recognitionRef.current = null
+    }
+  }, [dispatchTranslation])
+
+  const runTranslation = () => {
+    void dispatchTranslation(translation)
+  }
+
+  // Quick-phrase chips are already canonical vocabulary, so translate them with
+  // the instant offline engine — no API round trip or loader needed.
+  const playQuickPhrase = (word: string) => {
+    setTranslation(word)
+    const { glossText } = translateOffline(word)
+    setAvatarPhrase(glossText || word)
+    setRequestId((current) => current + 1)
+  }
+
+  const toggleVoiceInput = () => {
+    const recognition = recognitionRef.current
+    if (!recognition) return
+    if (isListening) recognition.stop()
+    else recognition.start()
+  }
+
+  const toggleLiveMode = () => {
+    const nextMode = !liveMode
+    liveModeRef.current = nextMode
+    setLiveMode(nextMode)
+    if (nextMode) {
+      liveCommittedRef.current = 0
+      liveChainRef.current = Promise.resolve()
+    }
+    const recognition = recognitionRef.current
+    if (!recognition) return
+    if (nextMode && !isListening) recognition.start()
+    if (!nextMode && isListening) recognition.stop()
+  }
+
+  const stopTranslation = () => {
+    liveModeRef.current = false
+    setLiveMode(false)
+    liveCommittedRef.current = 0
+    if (isListening) recognitionRef.current?.stop()
+    setStopId((current) => current + 1)
+  }
+
+  const scrollQuickPhrases = (direction: -1 | 1) => {
+    quickPhrasesRef.current?.scrollBy({ left: direction * 260, behavior: 'smooth' })
+  }
+
+  const openAuth = (mode: 'signin' | 'signup') => {
+    setAuthMode(mode)
+    setAuthOpen(true)
+  }
+
+  const submitAuth = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const email = String(data.get('email') || '')
+    const name = authMode === 'signup' ? String(data.get('name') || '') : email.split('@')[0]
+    const nextAccount = { name: name || 'Member', email }
+    window.localStorage.setItem('yap-render-account', JSON.stringify(nextAccount))
+    setAccount(nextAccount)
+    setAuthOpen(false)
+  }
+
+  const signOut = () => {
+    window.localStorage.removeItem('yap-render-account')
+    setAccount(null)
+    setAccountMenuOpen(false)
+    setDashboardOpen(false)
+    setAuthOpen(false)
+  }
+
+  return (
+    <main className="site-shell">
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label="Yap and Render home">
+          <span className="brand-mark"><img src="/yap-render-logo-mark.png" alt="" /></span>
+          <span>yap &amp; render</span>
+        </a>
+        <nav className={menuOpen ? 'nav-links nav-open' : 'nav-links'} aria-label="Main navigation">
+          <a href="#how-it-works" onClick={() => setMenuOpen(false)}>How it works</a>
+          <a href="#why-it-matters" onClick={() => setMenuOpen(false)}>Why it matters</a>
+          <a href="#about" onClick={() => setMenuOpen(false)}>About</a>
+        </nav>
+        <div className="auth-actions">
+          {account ? <div className="account-menu"><button className="account-button" onClick={() => setAccountMenuOpen((open) => !open)} aria-expanded={accountMenuOpen} aria-haspopup="menu"><UserRound size={15} /> {account.name}</button>{accountMenuOpen && <div className="account-dropdown" role="menu"><button type="button" role="menuitem" onClick={() => { setAccountMenuOpen(false); setDashboardOpen(true) }}><LayoutDashboard size={15} /> Dashboard</button><button type="button" role="menuitem" onClick={signOut}><LogOut size={15} /> Sign out</button></div>}</div> : <><button className="auth-link" onClick={() => openAuth('signin')}>Sign in</button><button className="nav-cta" onClick={() => openAuth('signup')}>Sign up <UserPlus size={15} /></button></>}
+        </div>
+        <button className="menu-toggle" onClick={() => setMenuOpen(!menuOpen)} aria-label={menuOpen ? 'Close menu' : 'Open menu'} aria-expanded={menuOpen}>
+          {menuOpen ? <X size={21} /> : <Menu size={21} />}
+        </button>
+      </header>
+
+      {authOpen && <div className="auth-backdrop" role="presentation" onMouseDown={() => setAuthOpen(false)}>
+        <section className="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title" onMouseDown={(event) => event.stopPropagation()}>
+          <button className="auth-close" onClick={() => setAuthOpen(false)} aria-label="Close account dialog"><X size={18} /></button>
+          <span className="auth-mark"><Hand size={18} /></span>
+          <p className="eyebrow">Yap / Render account</p>
+          <h2 id="auth-title">{account ? 'You are signed in.' : authMode === 'signup' ? 'Create your account.' : 'Welcome back.'}</h2>
+          {account ? <><p className="auth-copy">Signed in as {account.email}</p><button className="auth-submit" onClick={signOut}>Sign out</button></> : <form onSubmit={submitAuth} className="auth-form">
+            {authMode === 'signup' && <label>Name<input name="name" required autoComplete="name" placeholder="Your name" /></label>}
+            <label>Email<input name="email" type="email" required autoComplete="email" placeholder="you@example.com" /></label>
+            <label>Password<input name="password" type="password" required minLength={6} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} placeholder="At least 6 characters" /></label>
+            <button className="auth-submit" type="submit">{authMode === 'signup' ? 'Create account' : 'Sign in'} <LogIn size={15} /></button>
+          </form>}
+          {!account && <button className="auth-switch" onClick={() => setAuthMode(authMode === 'signup' ? 'signin' : 'signup')}>{authMode === 'signup' ? 'Already have an account? Sign in' : 'New here? Create an account'}</button>}
+        </section>
+      </div>}
+
+      {dashboardOpen && account && <div className="auth-backdrop dashboard-backdrop" role="presentation" onMouseDown={() => setDashboardOpen(false)}>
+        <section className="dashboard-modal" role="dialog" aria-modal="true" aria-labelledby="dashboard-title" onMouseDown={(event) => event.stopPropagation()}>
+          <button className="auth-close" onClick={() => setDashboardOpen(false)} aria-label="Close dashboard"><X size={18} /></button>
+          <div className="dashboard-heading"><span className="auth-mark"><LayoutDashboard size={18} /></span><div><p className="eyebrow">Your dashboard</p><h2 id="dashboard-title">Hello, {account.name}.</h2></div></div>
+          <div className="dashboard-profile"><span className="dashboard-avatar">{account.name.charAt(0).toUpperCase()}</span><div><strong>{account.name}</strong><span>{account.email}</span></div></div>
+          <div className="dashboard-stats" aria-label="Account status"><div><span>Account</span><strong>Active</strong></div><div><span>Translator</span><strong>Ready</strong></div><div><span>Voice language</span><strong>English (IN)</strong></div></div>
+          <div className="dashboard-details"><p>Account details</p><dl><div><dt>Name</dt><dd>{account.name}</dd></div><div><dt>Email</dt><dd>{account.email}</dd></div></dl></div>
+          <button className="auth-submit" onClick={() => { setDashboardOpen(false); document.getElementById('try-it')?.scrollIntoView({ behavior: 'smooth' }) }}>Open translator <ArrowDownRight size={15} /></button>
+        </section>
+      </div>}
+
+      {aboutOpen && <div className="auth-backdrop about-backdrop" role="presentation" onMouseDown={() => setAboutOpen(false)}>
+        <section className="about-modal" role="dialog" aria-modal="true" aria-labelledby="about-title" onMouseDown={(event) => event.stopPropagation()}>
+          <button className="auth-close" onClick={() => setAboutOpen(false)} aria-label="Close About Us dialog"><X size={18} /></button>
+          <div className="about-identity">
+            <span className="about-logo-mark"><img src="/yap-render-logo-mark.png" alt="Yap & Render logo" /></span>
+            <p className="about-logo-wordmark">yap <span>&amp;</span> render</p>
+          </div>
+          <p className="eyebrow">About us</p>
+          <h2 id="about-title">Making space for<br /><em>every voice.</em></h2>
+          <p className="about-copy">Yap &amp; Render is building a more connected future through language and technology.</p>
+          <p className="about-copy">We turn spoken words into Indian Sign Language, helping conversations feel more open and human.</p>
+          <p className="about-copy">Our work brings together thoughtful design, accessible technology, and real community needs.</p>
+          <p className="about-copy">Together, we are creating more ways for people to be heard, understood, and included.</p>
+          <div className="about-team" aria-label="Yap and Render team">
+            {team.map((member) => <div className="about-member" key={member.name}>
+              <div className="about-member-avatar" aria-label={`${member.name} profile picture`}>{member.image ? <img src={member.image} alt="" /> : member.name.charAt(0)}</div>
+              <strong>{member.name}</strong><span>{member.role}</span>
+              {member.linkedin && <a className="about-member-link" href={member.linkedin} target="_blank" rel="noreferrer" aria-label={`Open ${member.name}'s LinkedIn profile`}><span className="about-member-link-mark">in</span> LinkedIn</a>}
+            </div>)}
+          </div>
+        </section>
+      </div>}
+
+      <section className={isMaximized ? 'hero section-pad is-demo-maximized' : 'hero section-pad'} id="top">
+        <div className="hero-copy reveal">
+          <p className="eyebrow"><span className="eyebrow-dot" /> Language, without limits</p>
+          <h1 className="hero-title"><span>Say it.</span><span><em>See it.</em></span><span>Share it.</span></h1>
+          <p className="hero-lede">Yap & Render translates spoken language into Indian Sign Language, so more people can be part of the conversation.</p>
+          <div className="hero-actions">
+            <a className="button button-dark" href="#try-it">See it in action <ArrowDownRight size={17} /></a>
+            <a className="text-link" href="#how-it-works">Explore the idea <ArrowRight size={15} /></a>
+          </div>
+          <div className="hero-highlights" aria-label="Yap and Render highlights"><span>ISL-first</span><span>Real-time signs</span><span>Human connection</span></div>
+          <p className="hero-note"><Sparkles size={14} /> Built with and for the Indian Deaf community</p>
+        </div>
+
+        <div className="avatar-stage reveal" id="try-it">
+          <div className="terminal-window" aria-label="Yap and Render live translation workspace">
+            <div className="terminal-chrome"><span className="chrome-dot red" /><span className="chrome-dot yellow" /><span className="chrome-dot green" /><span className="terminal-title">yap / render</span><button
+              type="button"
+              className="terminal-maximize-toggle"
+              onClick={() => setIsMaximized((maximized) => !maximized)}
+              aria-label={isMaximized ? 'Restore avatar canvas size' : 'Maximize avatar canvas'}
+              aria-pressed={isMaximized}
+              title={isMaximized ? 'Restore size (Esc)' : 'Maximize canvas'}
+            >
+              {isMaximized ? <Minimize2 size={16} strokeWidth={1.7} /> : <Maximize2 size={16} strokeWidth={1.7} />}
+            </button></div>
+            <div className={isMaximized ? 'terminal-body avatar-terminal-body is-maximized' : 'terminal-body avatar-terminal-body'}>
+              <div className="avatar-workspace">
+              <div
+                className={isMaximized ? 'avatar-canvas-shell is-maximized' : 'avatar-canvas-shell'}
+                aria-label="Interactive 3D avatar canvas ready for Indian Sign Language playback"
+                onTransitionEnd={(event) => {
+                  if (event.propertyName === 'height') window.dispatchEvent(new Event('resize'))
+                }}
+              >
+                <AvatarPlayer phrase={avatarPhrase} requestId={requestId} model={avatarModel} appendToQueue={liveMode} stopId={stopId} resetId={resetId} speed={speed} onStateChange={setAvatarState} />
+                <span className="canvas-badge"><span className="live-dot" /> ISL AVATAR · {avatarState}</span>
+                <div className={isTranslating ? 'engine-selector is-busy' : 'engine-selector'} role="group" aria-label="Translation engine">
+                  <button type="button" className={translationEngine === 'online' ? 'is-selected' : ''} onClick={() => chooseTranslationEngine('online')} aria-pressed={translationEngine === 'online'} title="Translate with Gemini AI (falls back to the offline engine automatically)"><Sparkles size={10} /> AI</button>
+                  <button type="button" className={translationEngine === 'offline' ? 'is-selected' : ''} onClick={() => chooseTranslationEngine('offline')} aria-pressed={translationEngine === 'offline'} title="Translate with the built-in offline rule engine">Offline</button>
+                  <span className="engine-status" aria-live="polite">{isTranslating ? 'translating…' : translationEngine === 'offline' ? 'offline' : translationMode === 'online' ? 'online' : 'AI unavailable'}</span>
+                </div>
+                <div className="avatar-selector" role="group" aria-label="Choose avatar"><span>AVATAR</span><button type="button" className={avatarModel === 'default' ? 'is-selected' : ''} onClick={() => setAvatarModel('default')} aria-pressed={avatarModel === 'default'}>Default</button><button type="button" className={avatarModel === 'human' ? 'is-selected' : ''} onClick={() => setAvatarModel('human')} aria-pressed={avatarModel === 'human'}>Human</button></div>
+              </div>
+              <aside className="avatar-command-panel" aria-label="Avatar playback and sign commands">
+                <div className="avatar-command-input">
+                  <input value={translation} onChange={(event) => setTranslation(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && runTranslation()} aria-label="Text to translate into Indian Sign Language" placeholder="Type a message…" />
+                  <button type="button" onClick={toggleVoiceInput} className={isListening ? 'voice-input is-listening' : 'voice-input'} aria-label={isListening ? 'Stop voice input' : 'Start voice input'} disabled={!speechSupported}>{isListening ? <MicOff size={15} /> : <Mic size={15} />}<span>{isListening ? 'Listening' : 'Voice'}</span></button>
+                  <button type="button" onClick={toggleLiveMode} className={liveMode ? 'live-translation is-active' : 'live-translation'} disabled={!speechSupported}><span /> Live</button>
+                </div>
+                <div className="avatar-command-actions"><button type="button" onClick={stopTranslation} className="terminal-play terminal-stop" aria-label="Stop translation" title="Stop translation"><Square size={11} fill="currentColor" /></button><button type="button" onClick={() => setResetId((c) => c + 1)} className="terminal-play terminal-stop" aria-label="Reset avatar" title="Reset avatar to rest pose"><span aria-hidden="true">↺</span></button><label className="avatar-speed" title="Animation speed">Speed<input type="range" min="0.5" max="3" step="0.25" value={speed} onChange={(e) => setSpeed(Number(e.target.value))} />{speed}×</label></div>
+                <div className="avatar-command-list" aria-label="Try a supported sign">
+                  {quickPhrases.map((word) => <button type="button" key={word} onClick={() => playQuickPhrase(word)}>{word}</button>)}
+                </div>
+              </aside>
+              </div>
+              <div className="translator-controls">
+                <input value={translation} onChange={(event) => setTranslation(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && runTranslation()} aria-label="Text to translate into Indian Sign Language" placeholder="Type a message…" />
+                <button type="button" onClick={toggleVoiceInput} className={isListening ? 'voice-input is-listening' : 'voice-input'} aria-label={isListening ? 'Stop voice input' : 'Start voice input'} title={speechSupported ? (isListening ? 'Stop listening' : 'Speak your message') : 'Voice input is not supported in this browser'} disabled={!speechSupported}>
+                  {isListening ? <MicOff size={15} /> : <Mic size={15} />}
+                  <span>{isListening ? 'Listening' : 'Voice'}</span>
+                </button>
+                <button type="button" onClick={toggleLiveMode} className={liveMode ? 'live-translation is-active' : 'live-translation'} disabled={!speechSupported} title="Continuously convert final speech into ISL"><span /> Live</button>
+              </div>
+              <div className="terminal-footer terminal-footer-live"><button type="button" onClick={stopTranslation} className="terminal-play terminal-stop" aria-label="Stop translation"><Square size={11} fill="currentColor" /></button><button type="button" onClick={() => setResetId((c) => c + 1)} className="terminal-play terminal-stop" aria-label="Reset avatar" title="Reset avatar to rest pose" style={{marginLeft: '4px'}}>↺</button><span>{liveMode ? 'live translation is listening' : avatarState === 'signing' ? 'translation in progress' : avatarState === 'loading' ? 'loading avatar' : 'ready — words or A–Z fingerspelling'}</span><label style={{display:'flex',alignItems:'center',gap:'4px',fontSize:'11px',opacity:0.7,marginLeft:'auto'}} title="Animation speed">Speed<input type="range" min="0.5" max="3" step="0.25" value={speed} onChange={(e) => setSpeed(Number(e.target.value))} style={{width:'60px',accentColor:'currentColor'}} />{speed}×</label><span className="terminal-time">ISL</span></div>
+              <div className="quick-phrases" aria-label="Try a supported sign">
+                <button type="button" className="quick-phrases-arrow" onClick={() => scrollQuickPhrases(-1)} aria-label="Show previous signs"><ChevronLeft size={15} /></button>
+                <div ref={quickPhrasesRef} className="quick-phrases-track">
+                  {quickPhrases.map((word) => <button key={word} onClick={() => playQuickPhrase(word)}>{word}</button>)}
+                </div>
+                <button type="button" className="quick-phrases-arrow" onClick={() => scrollQuickPhrases(1)} aria-label="Show more signs"><ChevronRight size={15} /></button>
+              </div>
+              <div className="terminal-footer"><span className="terminal-play">{avatarState === 'signing' ? <Square size={11} fill="currentColor" /> : <Play size={14} fill="currentColor" />}</span><span>{avatarState === 'signing' ? 'translation in progress' : avatarState === 'loading' ? 'loading avatar' : 'ready — words or A–Z fingerspelling'}</span><span className="terminal-time">ISL</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="marquee-band" aria-label="Product promise"><div>VOICE <span>→</span> SIGN <span>→</span> UNDERSTANDING <span>→</span> BELONGING <span>→</span> VOICE <span>→</span> SIGN</div></section>
+
+      <section className="intro section-pad reveal" id="how-it-works">
+        <div className="section-kicker">The simple idea</div>
+        <div className="intro-content"><h2>Communication should never need a <em>middle ground.</em></h2><div><p>Most translation tools move between languages. We are building a bridge between ways of communicating.</p><a className="text-link" href="#why-it-matters">Why we&apos;re building this <ArrowRight size={15} /></a></div></div>
+      </section>
+
+      <section className="feature-section section-pad" id="why-it-matters">
+        <div className="feature-heading reveal"><p className="eyebrow"><span className="eyebrow-dot" /> From yap to render</p><h2>One conversation.<br /><em>Two ways to be heard.</em></h2></div>
+        <div className="feature-grid">{features.map(({ icon: Icon, title, text }, index) => <article className="feature-card reveal" key={title}><span className="feature-number">0{index + 1}</span><div className="feature-icon"><Icon size={22} /></div><h3>{title}</h3><p>{text}</p></article>)}</div>
+      </section>
+
+      <section className="proof-band reveal"><div><strong>01</strong><span>shared language</span></div><div><strong>∞</strong><span>possibilities to connect</span></div><div><strong>100%</strong><span>human at the centre</span></div></section>
+
+      <section className="final-cta section-pad reveal" id="about"><div className="cta-symbol"><AudioLines size={28} /></div><p className="eyebrow">A more connected future</p><h2>Let&apos;s make room<br />for <em>every voice.</em></h2><p>We&apos;re early, curious, and building in the open.</p><button type="button" className="button button-coral" onClick={() => setAboutOpen(true)}>About Us <ArrowRight size={17} /></button></section>
+
+      <footer className="footer"><a className="brand" href="#top" aria-label="Yap and Render home"><span className="brand-mark"><img src="/yap-render-logo-mark.png" alt="" /></span><span>yap &amp; render</span></a><span>Made for more ways to connect.</span><span>© 2026 Yap & Render</span></footer>
+    </main>
+  )
+}
