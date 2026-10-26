@@ -9,23 +9,24 @@ import type { ResolvedSign } from './types'
  * from one sign into the next. Isolated
  * signs played one after another are not continuous, grammatical ISL.
  */
+/** `start` is the index in the plan of the segment's first item, so the UI can tell which words are being played. */
 export type Segment =
-  | { type: 'avatar'; phrase: string; items: ResolvedSign[] }
-  | { type: 'video'; item: Extract<ResolvedSign, { kind: 'islrtc_video' }> }
-  | { type: 'pose'; items: Extract<ResolvedSign, { kind: 'islrtc_pose' }>[] }
-  | { type: 'unresolved'; item: Extract<ResolvedSign, { kind: 'unresolved' }> }
+  | { type: 'avatar'; start: number; phrase: string; items: ResolvedSign[] }
+  | { type: 'video'; start: number; item: Extract<ResolvedSign, { kind: 'islrtc_video' }> }
+  | { type: 'pose'; start: number; items: Extract<ResolvedSign, { kind: 'islrtc_pose' }>[] }
+  | { type: 'unresolved'; start: number; item: Extract<ResolvedSign, { kind: 'unresolved' }> }
 
 export function buildSegments(plan: readonly ResolvedSign[]): Segment[] {
   const segments: Segment[] = []
-  for (const item of plan) {
+  for (const [start, item] of plan.entries()) {
     if (item.kind === 'islrtc_video') {
-      segments.push({ type: 'video', item })
+      segments.push({ type: 'video', start, item })
     } else if (item.kind === 'islrtc_pose') {
       const last = segments[segments.length - 1]
       if (last?.type === 'pose') last.items.push(item)
-      else segments.push({ type: 'pose', items: [item] })
+      else segments.push({ type: 'pose', start, items: [item] })
     } else if (item.kind === 'unresolved') {
-      segments.push({ type: 'unresolved', item })
+      segments.push({ type: 'unresolved', start, item })
     } else {
       const words = item.kind === 'yap_animation' ? [item.token] : item.letters
       const last = segments[segments.length - 1]
@@ -33,7 +34,7 @@ export function buildSegments(plan: readonly ResolvedSign[]): Segment[] {
         last.items.push(item)
         last.phrase += ' ' + words.join(' ')
       } else {
-        segments.push({ type: 'avatar', phrase: words.join(' '), items: [item] })
+        segments.push({ type: 'avatar', start, phrase: words.join(' '), items: [item] })
       }
     }
   }

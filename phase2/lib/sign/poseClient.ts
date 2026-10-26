@@ -1,4 +1,4 @@
-import { clipFor, isPoseTrack, type PoseClip } from './poseTrack'
+import { clipFor, isPoseTrack, smoothTrack, type PoseClip } from './poseTrack'
 import type { PoseSign, ResolvedSign, VideoSign } from './types'
 
 /** The recorded video for the same clip: what a sign falls back to when its avatar track cannot be used. */
@@ -25,7 +25,7 @@ export async function loadPoseClips(
         const res = await fetchImpl(`/api/islrtc-pose/${encodeURIComponent(id)}`)
         if (!res.ok) return
         const track: unknown = await res.json()
-        if (isPoseTrack(track)) clips.set(id, clipFor(track, item.pose))
+        if (isPoseTrack(track)) clips.set(id, clipFor(smoothTrack(track), item.pose))
       } catch {
         // falls through to the video below
       }

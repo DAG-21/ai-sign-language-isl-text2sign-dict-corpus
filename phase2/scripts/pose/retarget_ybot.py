@@ -47,7 +47,8 @@ def load_rig():
         for c in nodes[i].get("children", []):
             walk(c)
 
-    walk(index["Armature"])
+    for root in [i for i in range(len(nodes)) if i not in parent]:  # a rig may sit under an "Armature" node (Y Bot) or start at the hips
+        walk(root)
     wq, wp = {}, {}
     for i in order:
         p = parent.get(i)

@@ -30,3 +30,6 @@ data/pose/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# per-word coverage list (built from the dictionary labels)
+data/coverage/

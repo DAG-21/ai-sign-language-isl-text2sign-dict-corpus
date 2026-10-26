@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { POSE_GATE, buildPoseIndex, evaluateGate, parseCsv, type PoseIndexFile, type PoseSummary } from '@/lib/sign/poseGate'
-import { BLEND_SECONDS, blendPose, clipFor, clipSeconds, isPoseTrack, runDuration, sampleClip, sampleRun, slerp, type Pose, type PoseTrack, type Quat } from '@/lib/sign/poseTrack'
+import { OVERLAP_SECONDS, blendPose, clipFor, clipSeconds, handHeight, isPoseTrack, planRun, runDuration, sampleClip, sampleRun, slerp, smoothTrack, type Pose, type PoseTrack, type Quat } from '@/lib/sign/poseTrack'
 import { loadPoseClips, poseToVideo } from '@/lib/sign/poseClient'
 import { lookupPoseTrack, poseResolverHook } from '@/lib/sign/poseServer'
 import { resolveGloss } from '@/lib/sign/resolver'
@@ -21,6 +21,16 @@ function track(): PoseTrack {
   return { fps: 10, frames: [0, 1, 2, 3, 4].map((i) => ({ t: i / 10, bones: { B: slerp(ID, Z90, i / 4) } })) }
 }
 const summary = (window: [number, number] = [1, 3]): PoseSummary => ({ handFrac: 0.6, poseFrac: 1, frames: 5, fps: 10, window })
+
+/** A left arm held at the given heights (-1 hanging, 0 straight out), one per frame: a rotation about z of asin(height) turns the +x arm. */
+const armQuat = (height: number): Quat => {
+  const half = Math.asin(height) / 2
+  return [0, 0, Math.sin(half), Math.cos(half)]
+}
+const armTrack = (heights: number[], fps = 10): PoseTrack => ({
+  fps,
+  frames: heights.map((h, i) => ({ t: i / fps, bones: { mixamorigLeftArm: armQuat(h), mixamorigLeftForeArm: ID } })),
+})
 
 describe('quality gate', () => {
   it('accepts a track with enough hands, a visible body and a window', () => {
@@ -89,25 +99,88 @@ describe('track playback maths', () => {
     near(sampleClip(clip, 0.2).B, slerp(ID, Z90, 0.5))
     near(sampleClip(clip, 9).B, Z90)
   })
-  it('plays a run: eases in from the neutral pose, plays the sign, eases back out', () => {
+  it('plays a run: fades in from the starting pose, plays the sign, fades out into the neutral pose', () => {
     const clip = clipFor(track(), summary([0, 4]), 0)
     const from: Pose = { B: [0, 0, -Math.SQRT1_2, Math.SQRT1_2] }
     const to: Pose = { B: [0, 0, 0.3826834324, 0.9238795325] }
-    expect(runDuration([clip])).toBeCloseTo(0.4 + 2 * BLEND_SECONDS, 6)
-    near(sampleRun([clip], 0, from, to).B, from.B)
-    near(sampleRun([clip], BLEND_SECONDS + 0.2, from, to).B, slerp(ID, Z90, 0.5)) // inside the sign
-    near(sampleRun([clip], runDuration([clip]), from, to).B, to.B)
-    near(sampleRun([clip], 99, from, to).B, to.B)
+    const plan = planRun([clip], from, to)
+    expect(plan.duration).toBeCloseTo(0.4, 6) // one sign: the fades overlap the sign, they do not add time
+    near(plan.sample(0).B, from.B)
+    near(plan.sample(0.2).B, slerp(ID, Z90, 0.5)) // middle of the sign, untouched by the fades
+    near(plan.sample(plan.duration).B, to.B)
+    near(plan.sample(99).B, to.B)
     expect(sampleRun([], 1, from, to)).toBe(to)
+  })
+  it('overlaps one sign into the next instead of stopping between them', () => {
+    const a = clipFor(track(), summary([0, 4]), 0) // 0.4 s
+    const b = clipFor(track(), summary([0, 4]), 0)
+    expect(runDuration([a, b])).toBeCloseTo(0.4 + 0.4 - 0.2, 6) // overlap is capped at half of each sign
+    expect(runDuration([a, b], 0.1)).toBeCloseTo(0.4 + 0.4 - 0.1, 6)
+    const neutral: Pose = { B: ID }
+    const plan = planRun([a, b], neutral, neutral, 0.1)
+    // halfway through the overlap: the end of sign one and the start of sign two, mixed, and neither the neutral pose
+    const mid = plan.sample(0.35)
+    const expected = blendPose(sampleClip(a, 0.35), sampleClip(b, 0.05), 0.5)
+    near(mid.B, expected.B)
+    expect(Math.abs(mid.B[3] - 1)).toBeGreaterThan(0.01)
+  })
+  it('caps the overlap at half of a short sign', () => {
+    const tiny = clipFor(track(), summary([1, 2]), 0) // 0.1 s
+    expect(runDuration([tiny, tiny], 0.25)).toBeCloseTo(0.1 + 0.1 - 0.05, 6)
+  })
+  it('measures how high the hands are held from the arm rotations', () => {
+    const hang = handHeight(armTrack([-1]).frames[0].bones)
+    const out = handHeight(armTrack([0]).frames[0].bones)
+    expect(hang).toBeCloseTo(-1, 5)
+    expect(out).toBeCloseTo(0, 5)
+    expect(handHeight(armTrack([0.5]).frames[0].bones)).toBeCloseTo(0.5, 5)
+    expect(handHeight({ mixamorigHead: ID })).toBeNaN()
+    // the higher of two hands counts
+    const both = { ...armTrack([-1]).frames[0].bones, mixamorigRightArm: [0, 0, -Math.sin(Math.asin(0.2) / 2), Math.cos(Math.asin(0.2) / 2)] as Quat, mixamorigRightForeArm: ID }
+    expect(handHeight(both)).toBeCloseTo(0.2, 5)
+  })
+  it('trims the rest periods off a sign, using the raised hands rather than the extraction window', () => {
+    const heights = [-0.9, -0.9, -0.9, -0.3, -0.1, -0.2, -0.3, -0.9, -0.9, -0.9]
+    const t = armTrack(heights)
+    expect(clipFor(t, summary([0, 9]), 0)).toMatchObject({ start: 3, end: 6 })
+    expect(clipFor(t, summary([0, 9]), 1)).toMatchObject({ start: 2, end: 7 })
+    // the window limits the search: hands raised outside it are not part of this sign
+    expect(clipFor(t, summary([4, 5]), 0)).toMatchObject({ start: 4, end: 5 })
+    // hands that never rise: fall back to the window
+    expect(clipFor(armTrack([-0.9, -0.9, -0.9, -0.9, -0.9, -0.9]), summary([1, 4]), 0)).toMatchObject({ start: 1, end: 4 })
+  })
+  it('removes a one-frame glitch and keeps the movement', () => {
+    const frames = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => ({ t: i / 10, bones: { B: slerp(ID, Z90, i / 9) } }))
+    frames[5] = { t: 0.5, bones: { B: [0.7, 0.1, -0.7, 0.1] } } // a wrist flip for one frame
+    const smooth = smoothTrack({ fps: 10, frames })
+    const clean = slerp(ID, Z90, 5 / 9)
+    const dot = Math.abs(smooth.frames[5].bones.B.reduce((acc, v, k) => acc + v * clean[k], 0))
+    expect(dot).toBeGreaterThan(0.99)
+    expect(smooth.frames).toHaveLength(10)
+    smooth.frames.forEach((f) => expect(Math.hypot(...f.bones.B)).toBeCloseTo(1, 6))
+    expect(Math.abs(smooth.frames[0].bones.B[3])).toBeGreaterThan(0.999) // the ends stay put, to within the edge smoothing
+    expect(smoothTrack(track())).not.toBe(undefined) // five frames is the shortest it smooths
+    const shortTrack: PoseTrack = { fps: 10, frames: track().frames.slice(0, 3) }
+    expect(smoothTrack(shortTrack)).toBe(shortTrack)
   })
   it('is continuous where one sign hands over to the next', () => {
     const a = clipFor(track(), summary([0, 4]), 0)
     const b = clipFor({ fps: 10, frames: [ID, ID, ID].map((q, i) => ({ t: i / 10, bones: { B: q } })) }, summary([0, 2]), 0)
     const neutral: Pose = { B: ID }
-    const join = BLEND_SECONDS + clipSeconds(a)
+    const join = clipSeconds(a) - 0.1 // inside the overlap of the default 0.25 s, capped at half the 0.2 s second sign
     const before = sampleRun([a, b], join - 1e-4, neutral, neutral).B
     const after = sampleRun([a, b], join + 1e-4, neutral, neutral).B
     expect(Math.hypot(before[2] - after[2], before[3] - after[3])).toBeLessThan(0.01)
+    // and through the whole run no step between 60 Hz frames is a jump
+    let worst = 0
+    let prev = sampleRun([a, b], 0, neutral, neutral).B
+    for (let t = 1 / 60; t < 0.6; t += 1 / 60) {
+      const q = sampleRun([a, b], t, neutral, neutral).B
+      worst = Math.max(worst, Math.hypot(q[0] - prev[0], q[1] - prev[1], q[2] - prev[2], q[3] - prev[3]))
+      prev = q
+    }
+    // the 90 degree turn is spread over the 6 frames of the 0.1 s overlap; smootherstep is at most 1.875x faster than linear at its middle
+    expect(worst).toBeLessThan((Math.hypot(Z90[2], Z90[3] - 1) / 6) * 2)
   })
   it('validates a fetched track before the avatar sees it', () => {
     expect(isPoseTrack(track())).toBe(true)

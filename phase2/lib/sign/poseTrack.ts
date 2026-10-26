@@ -11,10 +11,17 @@ export type PoseTrack = { fps: number; frames: { t: number; bones: Record<string
 /** A track trimmed to the frames in which the sign is made (inclusive indices). */
 export type PoseClip = { track: PoseTrack; start: number; end: number }
 
-/** Seconds spent easing from one pose to the next (rest to sign, sign to sign, sign to rest). */
-export const BLEND_SECONDS = 0.25
-/** Frames kept on each side of the signing window so the hands do not start or stop abruptly. */
-export const WINDOW_PAD_FRAMES = 6
+/** Seconds over which one sign is cross-faded into the next (and the first sign out of the starting pose, the last into the ending pose). */
+export const OVERLAP_SECONDS = 0.25
+/** Kept for callers that think of the same value as a blend length. */
+export const BLEND_SECONDS = OVERLAP_SECONDS
+/** Frames kept before the first and after the last moment the hands are clearly raised. */
+export const WINDOW_PAD_FRAMES = 3
+/**
+ * Hand height (-1 hanging by the side, 0 straight out, +1 overhead) above which the hands count as signing. Hands hang at about -0.9 and
+ * every sign I looked at keeps them above -0.5, so -0.6 separates the sign from the rest periods before and after it.
+ */
+export const RAISED_HEIGHT = -0.6
 
 const isQuat = (q: unknown): q is Quat => Array.isArray(q) && q.length === 4 && q.every((v) => typeof v === 'number' && Number.isFinite(v))
 
@@ -25,12 +32,94 @@ export function isPoseTrack(value: unknown): value is PoseTrack {
   return track.frames.every((f) => f && typeof f.t === 'number' && f.bones && typeof f.bones === 'object' && Object.values(f.bones).every(isQuat))
 }
 
-/** Trim a track to its signing window (with padding), clamped to the frames that exist. */
+function qmul(a: Quat, b: Quat): Quat {
+  return [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ]
+}
+
+function rotateY(q: Quat, v: [number, number, number]): number {
+  const p: Quat = [v[0], v[1], v[2], 0]
+  return qmul(qmul(q, p), [-q[0], -q[1], -q[2], q[3]])[1]
+}
+
+/**
+ * How high the higher hand is held, from the arm and forearm rotations: the vertical part of the arm direction and the forearm direction,
+ * averaged (the two bones are about the same length). The tracks store each bone's rotation in the rig's own T-pose, where the left arm
+ * points along +x and the right arm along -x. NaN when the arm bones are missing.
+ */
+export function handHeight(bones: Record<string, Quat>): number {
+  let best = NaN
+  for (const [side, dir] of [['Left', 1], ['Right', -1]] as const) {
+    const arm = bones[`mixamorig${side}Arm`]
+    const fore = bones[`mixamorig${side}ForeArm`]
+    if (!arm || !fore) continue
+    const height = (rotateY(arm, [dir, 0, 0]) + rotateY(qmul(arm, fore), [dir, 0, 0])) / 2
+    if (!(height <= best)) best = height
+  }
+  return best
+}
+
+/**
+ * Trim a track to the part in which the hands are signing: from the first to the last frame with a hand raised above RAISED_HEIGHT, inside the
+ * extraction's signing window, plus a few frames. The window itself still includes the hands rising from and returning to rest, which made every
+ * sign start and end at rest. Without arm bones, or if the hands never rise, the window (with the same padding) is used.
+ */
 export function clipFor(track: PoseTrack, summary: Pick<PoseSummary, 'window'>, pad = WINDOW_PAD_FRAMES): PoseClip {
   const last = track.frames.length - 1
-  const start = Math.max(0, Math.min(last - 1, Math.round(summary.window[0]) - pad))
-  const end = Math.max(start + 1, Math.min(last, Math.round(summary.window[1]) + pad))
+  const lo = Math.max(0, Math.min(last - 1, Math.round(summary.window[0])))
+  const hi = Math.max(lo + 1, Math.min(last, Math.round(summary.window[1])))
+  let first = -1
+  let final = -1
+  for (let i = lo; i <= hi; i += 1) {
+    if (handHeight(track.frames[i].bones) > RAISED_HEIGHT) {
+      if (first < 0) first = i
+      final = i
+    }
+  }
+  const [a, b] = first >= 0 ? [first, final] : [lo, hi]
+  const start = Math.max(0, Math.min(last - 1, a - pad))
+  const end = Math.max(start + 1, Math.min(last, b + pad))
   return { track, start, end }
+}
+
+/**
+ * Remove one- and two-frame glitches (a hand that drops out of detection for a moment flips its wrist and fingers) and soften the rest:
+ * a median of five on each quaternion component, then a light [1 2 1] average. Applied once when a track is loaded.
+ */
+export function smoothTrack(track: PoseTrack): PoseTrack {
+  const n = track.frames.length
+  if (n < 5) return track
+  const names = new Set<string>()
+  for (const f of track.frames) for (const name of Object.keys(f.bones)) names.add(name)
+  const out = track.frames.map((f) => ({ t: f.t, bones: {} as Record<string, Quat> }))
+  const median = (v: number[]) => v.sort((x, y) => x - y)[v.length >> 1]
+  for (const name of names) {
+    const series: Quat[] = []
+    let prev: Quat | null = null
+    for (const f of track.frames) {
+      let q: Quat = f.bones[name] ?? prev ?? [0, 0, 0, 1]
+      if (prev && prev[0] * q[0] + prev[1] * q[1] + prev[2] * q[2] + prev[3] * q[3] < 0) q = [-q[0], -q[1], -q[2], -q[3]]
+      series.push(q)
+      prev = q
+    }
+    const med = series.map((_, i) => {
+      const window = [-2, -1, 0, 1, 2].map((d) => series[Math.min(n - 1, Math.max(0, i + d))])
+      return [0, 1, 2, 3].map((c) => median(window.map((q) => q[c])))
+    })
+    for (let i = 0; i < n; i += 1) {
+      const a = med[Math.max(0, i - 1)]
+      const b = med[i]
+      const c = med[Math.min(n - 1, i + 1)]
+      const v = [0, 1, 2, 3].map((k) => (a[k] + 2 * b[k] + c[k]) / 4)
+      const len = Math.hypot(v[0], v[1], v[2], v[3]) || 1
+      out[i].bones[name] = [v[0] / len, v[1] / len, v[2] / len, v[3] / len]
+    }
+  }
+  return { fps: track.fps, frames: out }
 }
 
 export function slerp(a: Quat, b: Quat, t: number): Quat {
@@ -87,29 +176,59 @@ export function sampleClip(clip: PoseClip, seconds: number): Pose {
 }
 
 const clamp01 = (x: number) => Math.min(1, Math.max(0, x))
-const ease = (u: number) => u * u * (3 - 2 * u)
+/** Smootherstep: zero velocity and acceleration at both ends. */
+const ease = (u: number) => clamp01(u) ** 3 * (clamp01(u) * (clamp01(u) * 6 - 15) + 10)
 
-export function runDuration(clips: readonly PoseClip[], blend = BLEND_SECONDS): number {
-  return clips.reduce((sum, c) => sum + clipSeconds(c), 0) + (clips.length + 1) * blend
-}
+/** `indexAt(seconds)` is the sign the run is on: the earlier one until the middle of the overlap, the later one after it. */
+export type RunPlan = { duration: number; sample: (seconds: number) => Pose; indexAt: (seconds: number) => number }
 
 /**
- * The pose `seconds` into a run of clips: ease from `from` into the first sign, play each sign, ease from one sign into the next, and
- * finally ease into `to`. `from` and `to` normally hold the avatar's neutral pose.
+ * Plan a run of signs as one continuous movement. Each sign is cross-faded into the next over `overlap` seconds while both are still moving
+ * (the end of one and the start of the next play together), so the hands never stop and restart between signs. The first sign is faded in
+ * from `from` and the last faded out into `to`, which normally hold the avatar's starting pose and its neutral pose.
  */
-export function sampleRun(clips: readonly PoseClip[], seconds: number, from: Pose, to: Pose, blend = BLEND_SECONDS): Pose {
-  if (!clips.length) return to
-  let cursor = 0
-  let previous = from
-  for (const clip of clips) {
-    const first = sampleClip(clip, 0)
-    if (seconds < cursor + blend) return blendPose(previous, first, ease(clamp01((seconds - cursor) / blend)))
-    cursor += blend
-    const length = clipSeconds(clip)
-    if (seconds < cursor + length) return sampleClip(clip, seconds - cursor)
-    cursor += length
-    previous = sampleClip(clip, length)
+export function planRun(clips: readonly PoseClip[], from: Pose, to: Pose, overlap = OVERLAP_SECONDS): RunPlan {
+  if (!clips.length) return { duration: 0, sample: () => to, indexAt: () => 0 }
+  const lengths = clips.map(clipSeconds)
+  const starts = [0]
+  const overlaps: number[] = []
+  for (let i = 0; i < clips.length - 1; i += 1) {
+    const o = Math.min(overlap, lengths[i] / 2, lengths[i + 1] / 2)
+    overlaps.push(o)
+    starts.push(starts[i] + lengths[i] - o)
   }
-  if (seconds < cursor + blend) return blendPose(previous, to, ease(clamp01((seconds - cursor) / blend)))
-  return to
+  const last = clips.length - 1
+  const duration = starts[last] + lengths[last]
+  const leadIn = Math.min(overlap, lengths[0] / 2)
+  const tailOut = Math.min(overlap, lengths[last] / 2)
+
+  const sample = (seconds: number): Pose => {
+    if (seconds >= duration) return to
+    let i = 0
+    while (i < last && starts[i + 1] <= seconds) i += 1
+    let pose: Pose
+    if (i > 0 && seconds - starts[i] < overlaps[i - 1]) {
+      pose = blendPose(sampleClip(clips[i - 1], seconds - starts[i - 1]), sampleClip(clips[i], seconds - starts[i]), ease((seconds - starts[i]) / overlaps[i - 1]))
+    } else {
+      pose = sampleClip(clips[i], seconds - starts[i])
+    }
+    if (seconds < leadIn) pose = blendPose(from, pose, ease(seconds / leadIn))
+    if (seconds > duration - tailOut) pose = blendPose(pose, to, ease((seconds - (duration - tailOut)) / tailOut))
+    return pose
+  }
+  const indexAt = (seconds: number): number => {
+    let i = 0
+    while (i < last && starts[i + 1] <= seconds) i += 1
+    return i > 0 && seconds - starts[i] < overlaps[i - 1] / 2 ? i - 1 : i
+  }
+  return { duration, sample, indexAt }
+}
+
+export function runDuration(clips: readonly PoseClip[], overlap = OVERLAP_SECONDS): number {
+  return planRun(clips, {}, {}, overlap).duration
+}
+
+/** The pose `seconds` into a run (see planRun). */
+export function sampleRun(clips: readonly PoseClip[], seconds: number, from: Pose, to: Pose, overlap = OVERLAP_SECONDS): Pose {
+  return planRun(clips, from, to, overlap).sample(seconds)
 }

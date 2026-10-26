@@ -2,10 +2,10 @@
   box-sizing: border-box;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto 1fr;
+  align-content: start;
   gap: 0.75rem;
   width: min(900px, 100%);
-  height: 100vh;
+  min-height: 100vh;
   margin: 0 auto;
   padding: 1.25rem 1rem;
 }
@@ -46,11 +46,124 @@
 
 .demo-output {
   position: relative;
+  display: flex;
+  flex-direction: column;
   grid-column: 1 / -1;
-  min-height: 320px;
+  min-height: 420px;
   border: 1px solid #ccd2c8;
   background: #efede7;
   overflow: hidden;
+}
+
+.demo-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 320px;
+}
+
+.demo-gloss {
+  padding: 0.6rem 0.7rem 0.5rem;
+  border-bottom: 1px solid #ccd2c8;
+  background: #fffdf8;
+}
+
+.demo-words {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.demo-word {
+  display: inline-flex;
+  flex-direction: column;
+  padding: 0.2rem 0.5rem 0.15rem;
+  border: 1px solid #ccd2c8;
+  background: #f5f1e9;
+  color: #4a5450;
+  font: 700 0.8rem ui-monospace, SFMono-Regular, Menlo, monospace;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.demo-word small {
+  font-size: 0.58rem;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+
+/* the word being signed now, and the ones already signed, are green */
+.demo-word.is-current {
+  border-color: #1b8a4b;
+  background: #1b8a4b;
+  color: #fff;
+  box-shadow: 0 0 0 3px rgba(27, 138, 75, 0.25);
+}
+
+.demo-word.is-done {
+  border-color: #1b8a4b;
+  background: #dcf1e5;
+  color: #14532d;
+}
+
+/* no sign exists for the word, or its sign could not be played */
+.demo-word.is-missing {
+  border-style: dashed;
+  border-color: #b3361b;
+  background: #fbeae6;
+  color: #b3361b;
+}
+
+.demo-word.is-skipped {
+  text-decoration: line-through;
+}
+
+.demo-word.is-failed {
+  border-color: #b7791f;
+  background: #fbf1dc;
+  color: #7a4f0e;
+}
+
+.demo-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1rem;
+  margin: 0.45rem 0 0;
+  color: #4a5450;
+  font: 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.demo-coverage span:empty {
+  display: none;
+}
+
+.demo-covered {
+  color: #14532d;
+  font-weight: 700;
+}
+
+.demo-notcovered {
+  color: #b3361b;
+  font-weight: 700;
+}
+
+.demo-caption {
+  position: absolute;
+  top: 0.6rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 0.25rem 1rem;
+  border-radius: 999px;
+  background: #1b8a4b;
+  color: #fff;
+  font: 800 1.35rem ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .demo-avatar {
@@ -81,4 +194,129 @@
 
 .demo-tag:empty {
   display: none;
+}
+
+.demo-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  grid-column: 1 / -1;
+}
+
+.demo-mode {
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #ccd2c8;
+  background: #fffdf8;
+  color: #4a5450;
+  font: 700 0.8rem ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+
+.demo-mode.is-on {
+  border-color: #172020;
+  background: #172020;
+  color: #f5f1e9;
+}
+
+.demo-phase1 {
+  margin-left: auto;
+  color: #b3361b;
+  font: 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.demo-phase1.is-up {
+  color: #14532d;
+}
+
+.demo-video-input {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.demo-url {
+  min-height: 0;
+}
+
+.demo-secondary {
+  align-self: flex-start;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid #172020;
+  background: transparent;
+  color: #172020;
+  font: 700 0.8rem ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+
+.demo-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.demo-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: #4a5450;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.demo-steps li::before {
+  content: '○ ';
+}
+
+.demo-steps li.is-done::before {
+  content: '✓ ';
+  color: #1b8a4b;
+}
+
+.demo-steps li.is-failed {
+  color: #b3361b;
+}
+
+.demo-lines {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 0;
+  max-height: 11rem;
+  overflow-y: auto;
+  border: 1px solid #ccd2c8;
+  background: #fffdf8;
+  list-style: none;
+}
+
+.demo-lines li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  padding: 0.35rem 0.7rem;
+  border-bottom: 1px solid #e6e2d8;
+  font-size: 0.8rem;
+}
+
+.demo-lines li.needs-review {
+  background: #fbf1dc;
+}
+
+.demo-line-en {
+  color: #4a5450;
+}
+
+.demo-line-gloss {
+  color: #172020;
+  font: 700 0.8rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.demo-lines small {
+  color: #6b756f;
+  white-space: nowrap;
+}
+
+.demo-line-was {
+  display: block;
+  margin-top: 0.1rem;
+  color: #6b756f;
+  font: italic 400 0.7rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }

@@ -7,9 +7,9 @@ import * as words from './animations/words'
 import * as alphabets from './animations/alphabets'
 import { defaultPose } from './animations/defaultPose'
 import { textToGloss } from './textToGloss'
-import { createFaceLayer } from './humanLayer'
 import { looksPreTranslated } from '@/lib/islVocabulary'
-import { runDuration, sampleRun, type Pose, type PoseClip } from '@/lib/sign/poseTrack'
+import { ResolutionGovernor, easedStep, frameSeconds, keyPoseHoldMs } from '@/lib/sign/motion'
+import { planRun, type Pose, type PoseClip, type RunPlan } from '@/lib/sign/poseTrack'
 
 type SignInstruction = [string, 'rotation', 'x' | 'y' | 'z', number, '+' | '-']
 type SignRuntime = {
@@ -20,21 +20,23 @@ type SignRuntime = {
   avatar?: THREE.Object3D
   /** Avatar tracks extracted from dictionary clips, while one is playing (see lib/sign/poseTrack.ts). */
   pose?: PoseRun
+  /** For each token of the phrase being played, how many animation frames had been queued up to and including it. */
+  wordEnds?: number[]
+  /** Animation frames played so far in this phrase. */
+  consumed?: number
 }
 
 type PoseRun = {
-  clips: PoseClip[]
-  /** Neutral pose the run eases out of and back into. */
-  from: Pose
-  to: Pose
+  plan: RunPlan
   start: number | null
-  duration: number
   bones: [string, THREE.Object3D][]
 }
 
 type BoneUserData = {
   restQuaternion?: THREE.Quaternion
   gestureRestQuaternion?: THREE.Quaternion
+  /** The bone's world rotation in the rig's rest pose. Y Bot's is the identity; another rig's bone axes may differ. */
+  restWorldQuaternion?: THREE.Quaternion
   restPosition?: THREE.Vector3
   restScale?: THREE.Vector3
   delta?: { x: number; y: number; z: number }
@@ -53,13 +55,21 @@ type AvatarPlayerProps = {
    * 'signing' when it starts and 'ready' when the last sign has eased back to the neutral pose.
    */
   poseRun?: { runId: number; clips: PoseClip[] } | null
+  /**
+   * Which word is being signed: for a phrase, the index of the token being played (the token count when the phrase is finished); for a run of
+   * dictionary tracks, the index of the sign being played.
+   */
+  onWordProgress?: (index: number) => void
   onStateChange: (state: 'loading' | 'ready' | 'signing') => void
 }
+
+// Remy's rig is in Mixamo's larger units (3.8 m tall at the rig's 0.01 scale); this brings him to Y Bot's 1.78 m so both fill the same frame.
+const HUMAN_SCALE = 0.47
 
 const wordAnimations = words as unknown as Record<string, (runtime: SignRuntime) => void>
 const alphabetAnimations = alphabets as unknown as Record<string, (runtime: SignRuntime) => void>
 
-export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQueue = false, stopId = 0, resetId = 0, speed = 1, poseRun = null, onStateChange }: AvatarPlayerProps) {
+export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQueue = false, stopId = 0, resetId = 0, speed = 1, poseRun = null, onWordProgress, onStateChange }: AvatarPlayerProps) {
   const mountRef = useRef<HTMLDivElement>(null)
   const runtimeRef = useRef<SignRuntime>({ animations: [], characters: [], pending: true })
   const readyRef = useRef(false)
@@ -67,6 +77,7 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
   const pendingPoseRef = useRef<{ runId: number; clips: PoseClip[] } | null>(null)
   const appendToQueueRef = useRef(appendToQueue)
   const speedRef = useRef(speed)
+  const wordProgressRef = useRef(onWordProgress)
 
   useEffect(() => {
     appendToQueueRef.current = appendToQueue
@@ -75,6 +86,10 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
   useEffect(() => {
     speedRef.current = speed
   }, [speed])
+
+  useEffect(() => {
+    wordProgressRef.current = onWordProgress
+  }, [onWordProgress])
 
   useEffect(() => {
     if (!requestId) return
@@ -146,7 +161,9 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
     const camera = new THREE.PerspectiveCamera(31, 1, 0.1, 1000)
     camera.position.set(0, 0.62, 3)
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    // Smooth motion matters more than razor edges. Drawing at 2x on an integrated GPU (measured: Intel Iris Xe) dropped the frame rate to about 20 fps
+    // with 170 ms stalls, so start at the screen's own density up to 1.5x and let the governor step down further if frames still run slow.
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5))
     renderer.shadowMap.enabled = true
     renderer.shadowMap.type = THREE.PCFShadowMap
     renderer.outputColorSpace = THREE.SRGBColorSpace
@@ -156,6 +173,7 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
     const keyLight = new THREE.DirectionalLight('#ffffff', 3.6)
     keyLight.position.set(3, 5, 4)
     keyLight.castShadow = true
+    keyLight.shadow.mapSize.set(1024, 1024)
     scene.add(keyLight)
     const rimLight = new THREE.PointLight('#ef714f', 15, 8)
     rimLight.position.set(-2.8, 2, 2)
@@ -174,35 +192,33 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
 
     let disposed = false
     const loader = new GLTFLoader()
-    // Both avatars are the same ybot rig. "Human" layers a procedural face and
-    // warm-toned armour on top at runtime; the model file is untouched.
-    const modelPath = '/models/ybot.glb'
+    // "Default" is the Y Bot mannequin, "Human" a real human character (Remy). Both use the Mixamo skeleton names and the same T-pose, but
+    // not the same bone axes, so every rotation is converted into the rig's own axes (see localFromDelta).
+    const modelPath = model === 'human' ? '/models/Remy.glb' : '/models/ybot.glb'
     loader.load(modelPath, (gltf) => {
       if (disposed) return
       const avatar = gltf.scene
+      const anisotropy = renderer.capabilities.getMaxAnisotropy()
       avatar.traverse((child) => {
         child.castShadow = true
         child.frustumCulled = false
+        // Sharper textures when the surface is seen at an angle (face, sleeves, hands).
+        const material = (child as THREE.Mesh).material
+        for (const m of Array.isArray(material) ? material : material ? [material] : []) {
+          for (const value of Object.values(m)) if (value instanceof THREE.Texture) value.anisotropy = anisotropy
+        }
       })
       runtime.avatar = avatar
       // Preserve the requested close framing, while placing the face just
       // above the canvas centre instead of against the top edge.
       avatar.position.y = -0.85
+      if (model === 'human') avatar.scale.setScalar(HUMAN_SCALE)
       scene.add(avatar)
-      if (model === 'human') {
-        applyWarmArmorColors(avatar)
-        const headBone = getAvatarBone(avatar, 'mixamorig:Head')
-        if (headBone) {
-          const faceLayer = createFaceLayer()
-          // Compensate for ybot's 0.01 rig scale and sit the head on the neck.
-          faceLayer.scale.set(13.5, 13.5, 13.5)
-          faceLayer.position.set(0, 2, 1)
-          headBone.add(faceLayer)
-        }
-      }
       // Animation tables author each gesture as a delta rotation from rest.
       // YBot's rig ships in a pure identity T-pose, so composing the delta onto
-      // each bone's captured rest quaternion reproduces the authored pose.
+      // each bone's captured rest quaternion reproduces the authored pose. Another
+      // rig has the same T-pose but its own bone axes: the delta is carried over
+      // through the bone's rest world rotation.
       captureRestQuaternions(avatar)
       // Apply the existing default-pose instructions immediately so every new
       // instance starts clean. Keeping those instructions in the frame queue
@@ -227,24 +243,51 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
     let animationFrame = 0
     let nextFrameAt = 0
     let wasSigning = false
+    let lastWord = -1
+    let lastPoseWord = -1
+    let lastFrameAt: number | null = null
+    const governor = new ResolutionGovernor(renderer.getPixelRatio())
     const animate = (now: number) => {
       animationFrame = requestAnimationFrame(animate)
+      const seconds = frameSeconds(now, lastFrameAt)
+      // Slow frames lower the drawing resolution rather than slowing the signing (a background tab is not counted).
+      if (lastFrameAt !== null && document.visibilityState === 'visible') {
+        const ratio = governor.frame(now - lastFrameAt)
+        if (ratio !== null) {
+          renderer.setPixelRatio(ratio)
+          resize()
+        }
+      }
+      lastFrameAt = now
       const queue = runtime.animations
       const pose = runtime.pose
       if (runtime.avatar && pose) {
         if (pose.start === null) pose.start = now
-        const seconds = ((now - pose.start) / 1000) * speedRef.current
-        const frame = sampleRun(pose.clips, seconds, pose.from, pose.to)
+        const trackSeconds = ((now - pose.start) / 1000) * speedRef.current
+        const word = pose.plan.indexAt(trackSeconds)
+        if (word !== lastPoseWord) {
+          lastPoseWord = word
+          wordProgressRef.current?.(word)
+        }
+        const frame = pose.plan.sample(trackSeconds)
         for (const [name, bone] of pose.bones) {
           const q = frame[name]
-          if (q) bone.quaternion.set(q[0], q[1], q[2], q[3])
+          if (q) bone.quaternion.copy(localFromDelta(bone.userData as BoneUserData, new THREE.Quaternion(q[0], q[1], q[2], q[3])))
         }
-        if (seconds >= pose.duration) {
+        if (trackSeconds >= pose.plan.duration) {
           runtime.pose = undefined
+          lastPoseWord = -1
           onStateChange('ready')
         }
       } else if (runtime.avatar && queue.length && now >= nextFrameAt) {
         wasSigning = true
+        const ends = runtime.wordEnds ?? []
+        const current = ends.findIndex((end) => end > (runtime.consumed ?? 0))
+        const word = current < 0 ? ends.length : current
+        if (word !== lastWord) {
+          lastWord = word
+          wordProgressRef.current?.(word)
+        }
         const frame = queue[0]
         for (let index = 0; index < frame.length;) {
           const [boneName, , axis, target, direction] = frame[index]
@@ -261,15 +304,15 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
           // Too small and long multi-stage signs (HELLO, SORRY, the meal
           // compounds) drag; too large and the shared raised-hand preparation
           // pose makes different signs look identical before their distinct
-          // movement is visible. 0.05 keeps each pose readable while roughly
-          // halving the runtime of the big signs.
-          const step = 0.05 * speedRef.current
+          // movement is visible. The pace (3 rad/s at speed 1, what 0.05 rad per frame
+          // was at 60 fps) now follows elapsed time, so a slower display does not slow the signing,
+          // and the last stretch of each move eases out (lib/sign/motion.ts).
           const inProgress = resolvedDirection === '+' ? value < resolvedTarget : value > resolvedTarget
           if (inProgress) {
+            const step = easedStep(Math.abs(resolvedTarget - value), seconds, speedRef.current)
             delta[axis] = resolvedDirection === '+' ? Math.min(value + step, resolvedTarget) : Math.max(value - step, resolvedTarget)
             const deltaQuaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(delta.x, delta.y, delta.z))
-            const gestureRest = userData.gestureRestQuaternion || userData.restQuaternion
-            bone.quaternion.copy(gestureRest ? gestureRest.clone().multiply(deltaQuaternion) : deltaQuaternion)
+            bone.quaternion.copy(localFromDelta(userData, deltaQuaternion))
             index += 1
           } else {
             frame.splice(index, 1)
@@ -277,13 +320,16 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
         }
         if (!frame.length) {
           queue.shift()
+          runtime.consumed = (runtime.consumed ?? 0) + 1
           // Brief hold on each authored key pose so the movement still reads,
-          // without the dead air that made every sign feel sluggish (was 360).
-          nextFrameAt = now + 170 / speedRef.current
+          // without the dead air that made every sign feel sluggish (was 360, then 170).
+          nextFrameAt = now + keyPoseHoldMs(speedRef.current)
         }
       }
       if (wasSigning && !queue.length) {
         wasSigning = false
+        wordProgressRef.current?.(runtime.wordEnds?.length ?? 0)
+        lastWord = -1
         onStateChange('ready')
       }
       renderer.render(scene, camera)
@@ -301,74 +347,6 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
   }, [model, onStateChange])
 
   return <div ref={mountRef} className="avatar-canvas" aria-label="Animated Indian Sign Language avatar" />
-}
-
-// Applies colour only to the existing skinned robot mesh. No vertices, bones,
-// weights, or animation instructions are changed, so the ISL movements remain
-// exactly the same while the body adopts the requested warm armour palette.
-function applyWarmArmorColors(avatar: THREE.Object3D) {
-  const chestCream = new THREE.Color('#e2d3bc')
-  const warmBeige = new THREE.Color('#d4bea1')
-  const limbBeige = new THREE.Color('#c8b093')
-  const lowerBeige = new THREE.Color('#bfa88c')
-  const neckCream = new THREE.Color('#d9c7ae')
-  const jointCharcoal = new THREE.Color('#4a4641')
-
-  avatar.traverse((child) => {
-    if (!(child as THREE.Mesh).isMesh) return
-    const mesh = child as THREE.Mesh
-    const positions = mesh.geometry?.attributes.position
-    if (!positions) return
-
-    if (mesh.name === 'Alpha_Surface') {
-      const colors = new Float32Array(positions.count * 3)
-      for (let index = 0; index < positions.count; index += 1) {
-        const x = positions.getX(index)
-        const y = positions.getY(index)
-        const z = positions.getZ(index)
-        const isNeck = y > 1.48 && Math.abs(x) < 0.12 && z > -0.1
-        const isChest = y >= 1.18 && Math.abs(x) <= 0.38
-        const isWaistOrHip = y >= 0.78 && y < 1.18 && Math.abs(x) <= 0.36
-        const isArm = Math.abs(x) > 0.34 && y > 0.82
-        const isCalfOrFoot = y < 0.42
-        const color = isNeck
-          ? neckCream
-          : isChest
-            ? chestCream
-            : isWaistOrHip
-              ? warmBeige
-              : isArm
-                ? limbBeige
-                : isCalfOrFoot
-                  ? lowerBeige
-                  : warmBeige
-        colors[index * 3] = color.r
-        colors[index * 3 + 1] = color.g
-        colors[index * 3 + 2] = color.b
-      }
-      mesh.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-      mesh.material = new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        roughness: 0.63,
-        metalness: 0.04,
-      })
-    }
-
-    if (mesh.name === 'Alpha_Joints') {
-      const colors = new Float32Array(positions.count * 3)
-      for (let index = 0; index < positions.count; index += 1) {
-        colors[index * 3] = jointCharcoal.r
-        colors[index * 3 + 1] = jointCharcoal.g
-        colors[index * 3 + 2] = jointCharcoal.b
-      }
-      mesh.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-      mesh.material = new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        roughness: 0.72,
-        metalness: 0.07,
-      })
-    }
-  })
 }
 
 function getAvatarBone(avatar: THREE.Object3D, boneName: string) {
@@ -392,10 +370,40 @@ function getAvatarBone(avatar: THREE.Object3D, boneName: string) {
   return undefined
 }
 
+const IDENTITY_EPSILON = 1e-4
+
+function isIdentity(q: THREE.Quaternion) {
+  return Math.abs(q.x) < IDENTITY_EPSILON && Math.abs(q.y) < IDENTITY_EPSILON && Math.abs(q.z) < IDENTITY_EPSILON
+}
+
+/**
+ * Turn a rotation authored for Y Bot (a delta from its rest pose in world-aligned bone axes, or a track's local rotation, which is the same thing)
+ * into the bone's local rotation on this rig, so the bone ends up turned the same way in the world. For Y Bot itself nothing changes.
+ */
+function localFromDelta(userData: BoneUserData, delta: THREE.Quaternion): THREE.Quaternion {
+  const rest = userData.gestureRestQuaternion || userData.restQuaternion
+  if (!rest) return delta.clone()
+  const world = userData.restWorldQuaternion
+  if (!world || isIdentity(world)) return rest.clone().multiply(delta)
+  return rest.clone().multiply(world.clone().invert().multiply(delta).multiply(world))
+}
+
+/** The inverse of localFromDelta: this rig's local rotation as the Y Bot-space rotation a track would hold. */
+function deltaFromLocal(userData: BoneUserData, local: THREE.Quaternion): THREE.Quaternion {
+  const rest = userData.gestureRestQuaternion || userData.restQuaternion
+  if (!rest) return local.clone()
+  const world = userData.restWorldQuaternion
+  const inner = rest.clone().invert().multiply(local)
+  if (!world || isIdentity(world)) return inner
+  return world.clone().multiply(inner).multiply(world.clone().invert())
+}
+
 function captureRestQuaternions(avatar: THREE.Object3D) {
+  avatar.updateMatrixWorld(true)
   avatar.traverse((child) => {
     if (child.type !== 'Bone') return
     const userData = child.userData as BoneUserData
+    userData.restWorldQuaternion = child.getWorldQuaternion(new THREE.Quaternion())
     userData.restQuaternion = child.quaternion.clone()
     userData.gestureRestQuaternion = userData.restQuaternion.clone()
     userData.restPosition = child.position.clone()
@@ -432,8 +440,7 @@ function resetAvatar(runtime: SignRuntime, model: 'default' | 'human') {
       const [resolvedTarget] = resolveInstructionForModel(boneName, axis, target, direction, model)
       delta[axis] = resolvedTarget
       const deltaQuaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(delta.x, delta.y, delta.z))
-      const gestureRest = userData.gestureRestQuaternion || userData.restQuaternion
-      bone.quaternion.copy(gestureRest ? gestureRest.clone().multiply(deltaQuaternion) : deltaQuaternion)
+      bone.quaternion.copy(localFromDelta(userData, deltaQuaternion))
     }
   }
   runtime.animations = []
@@ -441,27 +448,35 @@ function resetAvatar(runtime: SignRuntime, model: 'default' | 'human') {
 }
 
 /**
- * Start playing avatar tracks. The avatar is first put in its neutral pose (the same one every phrase starts from); the run eases out of it
- * into the first sign and back into it after the last. Only the bones the tracks drive (arms, hands, fingers, neck, head) are touched.
+ * Start playing avatar tracks. The run fades in from wherever the avatar is now (the end of the previous animation, not a reset), so nothing
+ * snaps, and fades out into the neutral pose that every phrase starts from. Only the bones the tracks drive (arms, hands, fingers, neck, head) are touched.
  */
 function startPoseRun(clips: PoseClip[], runtime: SignRuntime, model: 'default' | 'human') {
   const avatar = runtime.avatar
   if (!avatar) return
-  resetAvatar(runtime, model)
   const names = new Set<string>()
   for (const clip of clips) {
     for (const index of [clip.start, clip.end]) for (const name of Object.keys(clip.track.frames[index].bones)) names.add(name)
   }
   const bones: [string, THREE.Object3D][] = []
-  const from: Pose = {}
   for (const name of names) {
     const bone = getAvatarBone(avatar, name)
-    if (!bone) continue
-    bones.push([name, bone])
-    const q = bone.quaternion
-    from[name] = [q.x, q.y, q.z, q.w]
+    if (bone) bones.push([name, bone])
   }
-  runtime.pose = { clips, from, to: { ...from }, start: null, duration: runDuration(clips), bones }
+  // Poses are held in Y Bot space (what the tracks use); localFromDelta / deltaFromLocal convert to and from this rig's own bone axes.
+  const read = (): Pose =>
+    Object.fromEntries(
+      bones.map(([name, bone]) => {
+        const q = deltaFromLocal(bone.userData as BoneUserData, bone.quaternion)
+        return [name, [q.x, q.y, q.z, q.w]]
+      }),
+    ) as Pose
+  const from = read()
+  // Neutral pose: reset the rig, read it, then put the bones back where they were so nothing moves yet.
+  resetAvatar(runtime, model)
+  const to = read()
+  for (const [name, bone] of bones) bone.quaternion.copy(localFromDelta(bone.userData as BoneUserData, new THREE.Quaternion(from[name][0], from[name][1], from[name][2], from[name][3])))
+  runtime.pose = { plan: planRun(clips, from, to), start: null, bones }
 }
 
 function resolveInstructionForModel(
@@ -486,7 +501,10 @@ function enqueuePhrase(input: string, runtime: SignRuntime, append = false) {
     // half-finished pose and can freeze on an unreachable target.
     if (runtime.avatar) resetAvatar(runtime, runtime.model ?? 'default')
     runtime.animations = []
+    runtime.wordEnds = []
+    runtime.consumed = 0
   }
+  runtime.wordEnds ??= []
 
   // The page now resolves every phrase to canonical ISL gloss (Gemini online,
   // rule-based offline) before it reaches here. When the input is already made
@@ -513,10 +531,8 @@ function enqueuePhrase(input: string, runtime: SignRuntime, append = false) {
   for (const token of tokens) {
     const word = token.toUpperCase()
     const wordAnimation = wordAnimations[word]
-    if (wordAnimation) {
-      wordAnimation(runtime)
-      continue
-    }
-    for (const letter of word) alphabetAnimations[letter]?.(runtime)
+    if (wordAnimation) wordAnimation(runtime)
+    else for (const letter of word) alphabetAnimations[letter]?.(runtime)
+    runtime.wordEnds.push(runtime.animations.length + (runtime.consumed ?? 0))
   }
 }

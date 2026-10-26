@@ -18,8 +18,8 @@ player in this repo have been run against that real index and real clips. Labels
 Example (PowerShell):
 ```
 $env:ISLRTC_DATA_DIR="C:\Dhiren\internship\islrtc"
-$env:ISLRTC_MANIFEST="C:\Dhiren\internship\ai-sign-language\data\islrtc\manifest.json"
-$env:ISLRTC_MAPPINGS="C:\Dhiren\internship\ai-sign-language\data\islrtc\approved_mappings.json"
+$env:ISLRTC_MANIFEST="data\islrtc\manifest.json"
+$env:ISLRTC_MAPPINGS="data\islrtc\approved_mappings.json"
 $env:ISLRTC_TRANSCODE="1"
 npm run build; npm start          # then open /demo
 ```
@@ -73,7 +73,7 @@ npm test          # vitest (78 tests; 3 real-data end-to-end tests skip unless t
 npm run typecheck # tsc --noEmit (the production build does NOT type-check: next.config.mjs ignores type errors)
 npm run build
 # real-data end-to-end + coverage:
-$env:PHASE1_GLOSS_DIR="C:\Dhiren\internship\ai-sign-language\data\translations"; $env:ISLRTC_MANIFEST=...; $env:ISLRTC_MAPPINGS=...; $env:ISLRTC_DATA_DIR=...; npm test
+$env:PHASE1_GLOSS_DIR="..\phase1\data\translations"; $env:ISLRTC_MANIFEST=...; $env:ISLRTC_MAPPINGS=...; $env:ISLRTC_DATA_DIR=...; npm test
 npx vite-node scripts/coverage-report.ts -- --manifest <manifest.json> --gloss <a.gloss.json> --gloss <b.gloss.json> [--require-review] [--fingerspell-unknown] [--synonyms off|exact|close] [--json out.json]
 ```
 This repo has no lint configuration, so there is no lint step.
@@ -97,7 +97,48 @@ the result is one `data/pose/tracks/<asset id>.bones.json.gz` per clip, plus `la
    `node node_modules/vite-node/vite-node.mjs scripts/build-pose-index.ts -- --dir data/pose` (`--min-hand`, `--min-body` change the thresholds).
 2. `POST /api/sign-plan` now returns `kind: "islrtc_pose"` for a dictionary word whose track passed the gate (otherwise `islrtc_video`, as before). `coverage.bySource.islrtc_pose` and `coverage.poseSequence` count them.
 3. `GET /api/islrtc-pose/<asset id>` serves the gzipped track (`Content-Encoding: gzip`). Only gated ids are served; anything else is 404 and the player falls back to the video.
-4. `AvatarPlayer` takes a `poseRun` prop: it eases from the neutral pose into each sign, blends sign to sign, and eases back. `/demo` uses it.
+4. `AvatarPlayer` takes a `poseRun` prop. A run of signs is one continuous movement: each track is smoothed when loaded (one- and two-frame glitches removed), trimmed to the part where the hands are raised, and cross-faded into the next over 0.25 s while both are still moving. The first sign fades in from wherever the avatar already is (no reset), and the last fades out into the neutral pose that phrases start from. `/demo` uses it. `/demo` shows the "human" avatar (`public/models/Remy.glb`, a Mixamo character with the same skeleton names and T-pose as Y Bot but different bone axes); `AvatarPlayer` converts every rotation, from the hand-made animations and from the tracks, through each bone's rest world rotation. Remy's proportions are close to Y Bot's (arm to eye height and shoulder width within about 5%), which is why the tracks, fitted to Y Bot, still land on his face. To use another Mixamo character: download it as FBX (T-pose, no animation) and run `scripts/convert_fbx_to_glb.py`.
 
 Without `pose_index.json` nothing changes: every dictionary word resolves as its video. A track that passes the gate is still unreviewed: the gate checks coverage, not that the hand shapes read correctly.
 Known limits: each sign is trimmed to its signing window but not otherwise reviewed; the torso is not driven; the face is used only for head direction; a Yap animation after a track starts from the neutral pose.
+
+### Following the words in `/demo`
+
+Above the avatar the demo lists the sentence's gloss words, each with how it is signed (hand-made, avatar motion, video, spelled, or no sign). The word being signed is a solid green chip and is also shown as a caption over the avatar; words already signed turn light green with a tick; a word with no sign is a dashed red chip, struck through once it has been passed over; a sign that could not be played is amber. The line under the chips counts the words covered and not covered, how the covered ones are signed, and names the words with no sign. `AvatarPlayer`'s `onWordProgress` reports the token (hand-made phrases) or sign (avatar tracks) being played; `lib/sign/progress.ts` turns that into the chip states.
+
+## Phase 1 and Phase 2 together (`/demo`)
+
+Phase 1 is the Python project in the `phase1` folder (a sibling of this `phase2` folder): transcript cleaning, sentence chunking, context grouping, then the gloss layers (Layer 1 LLM through
+Groq `openai/gpt-oss-120b`, Layer 2 spaCy) and the YouTube front end (download, audio, Whisper). Phase 2 is this app: resolve each gloss word to a hand-made
+animation, an avatar motion, a dictionary video or fingerspelling, and sign it with the avatar. They are two programs joined over HTTP on this machine.
+
+```
+English text ─┐
+Video link ───┼─> Phase 1 server (127.0.0.1:8765) ─> gloss per sentence ─> /api/sign-plan (resolver) ─> avatar
+Gloss words ──┴──────────────────────────────────────────────────────────┘ (typed gloss skips Phase 1)
+```
+
+Start both with one command (Phase 1 opens in its own window; if something already listens on 8765 it is reused):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev-all.ps1
+# Phase 1 in another place:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev-all.ps1 -Phase1Dir "D:\path\to\phase1"
+```
+
+`/demo` has three inputs. **English text** and **Video link** go through Phase 1; **Gloss words** is the old direct input. The top right shows whether Phase 1 is
+connected and whether it has its LLM key. Under the input, every sentence shows the English, the gloss that will be signed, and which layer produced it.
+
+- **LLM layer first.** A sentence uses Layer 1's final gloss. If the LLM did not translate it (no key, quota, error) the spaCy layer's gloss is used and the row is
+  marked *review*, because it is the weaker candidate. Phase 1's own review flag and warnings are shown on hover.
+- **Phase 1 not running.** English text falls back to the old offline rule engine (`translateOffline`) and says so. A video link cannot, because the download and
+  transcription are Phase 1's job.
+- **Name differences.** Phase 1 writes `NOT` and `HI`; the signs are `NO` and `HELLO`. `SIGN_ALIASES` in `lib/sign/phase1.ts` renames them and the row says so.
+  Add to it only after deciding that the two words are the same sign.
+- **Keys.** The Groq key lives in Phase 1's own `.env`. This app never reads it, and the route only reports whether it is present.
+- **Video.** Paste a public link, press *Read the video*, wait for the three steps (video, audio, transcript), then *Translate & sign*. The first 20 sentences are
+  signed. Phase 1 limits: public videos, 30 minutes, one at a time.
+
+App routes (all proxy to Phase 1 and accept loopback only): `POST /api/phase1/translate` (`{ text }` or `{ job_id }`), `GET /api/phase1/status`,
+`POST /api/phase1/youtube` (`{ url }`) and `GET /api/phase1/youtube?job_id=`. The mapping from Phase 1's answer to the gloss is `extractSentences` in
+`lib/sign/phase1.ts`, covered by `tests/phase1.test.ts`.
