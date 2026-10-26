@@ -9,6 +9,7 @@ import { defaultPose } from './animations/defaultPose'
 import { textToGloss } from './textToGloss'
 import { createFaceLayer } from './humanLayer'
 import { looksPreTranslated } from '@/lib/islVocabulary'
+import { runDuration, sampleRun, type Pose, type PoseClip } from '@/lib/sign/poseTrack'
 
 type SignInstruction = [string, 'rotation', 'x' | 'y' | 'z', number, '+' | '-']
 type SignRuntime = {
@@ -17,6 +18,18 @@ type SignRuntime = {
   pending: boolean
   model?: 'default' | 'human'
   avatar?: THREE.Object3D
+  /** Avatar tracks extracted from dictionary clips, while one is playing (see lib/sign/poseTrack.ts). */
+  pose?: PoseRun
+}
+
+type PoseRun = {
+  clips: PoseClip[]
+  /** Neutral pose the run eases out of and back into. */
+  from: Pose
+  to: Pose
+  start: number | null
+  duration: number
+  bones: [string, THREE.Object3D][]
 }
 
 type BoneUserData = {
@@ -35,17 +48,23 @@ type AvatarPlayerProps = {
   stopId?: number
   resetId?: number
   speed?: number
+  /**
+   * Play avatar tracks extracted from dictionary clips (`islrtc_pose`) instead of a phrase. A new `runId` starts a new run; it reports
+   * 'signing' when it starts and 'ready' when the last sign has eased back to the neutral pose.
+   */
+  poseRun?: { runId: number; clips: PoseClip[] } | null
   onStateChange: (state: 'loading' | 'ready' | 'signing') => void
 }
 
 const wordAnimations = words as unknown as Record<string, (runtime: SignRuntime) => void>
 const alphabetAnimations = alphabets as unknown as Record<string, (runtime: SignRuntime) => void>
 
-export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQueue = false, stopId = 0, resetId = 0, speed = 1, onStateChange }: AvatarPlayerProps) {
+export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQueue = false, stopId = 0, resetId = 0, speed = 1, poseRun = null, onStateChange }: AvatarPlayerProps) {
   const mountRef = useRef<HTMLDivElement>(null)
   const runtimeRef = useRef<SignRuntime>({ animations: [], characters: [], pending: true })
   const readyRef = useRef(false)
   const pendingPhraseRef = useRef<{ phrase: string; requestId: number } | null>(null)
+  const pendingPoseRef = useRef<{ runId: number; clips: PoseClip[] } | null>(null)
   const appendToQueueRef = useRef(appendToQueue)
   const speedRef = useRef(speed)
 
@@ -70,9 +89,28 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
   }, [phrase, requestId, onStateChange])
 
   useEffect(() => {
+    if (!poseRun?.runId) return
+    if (!readyRef.current) {
+      pendingPoseRef.current = poseRun
+      onStateChange('loading')
+      return
+    }
+    startPoseRun(poseRun.clips, runtimeRef.current, model)
+    onStateChange('signing')
+    // A run starts only when a new one is handed in; `model` and the callback changing must not restart it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poseRun])
+
+  useEffect(() => {
     if (!stopId) return
     pendingPhraseRef.current = null
-    runtimeRef.current.animations = []
+    pendingPoseRef.current = null
+    const runtime = runtimeRef.current
+    if (runtime.pose) {
+      runtime.pose = undefined
+      resetAvatar(runtime, model)
+    }
+    runtime.animations = []
     onStateChange('ready')
   }, [stopId, onStateChange])
 
@@ -92,6 +130,7 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
     runtime.characters = []
     runtime.pending = true
     runtime.avatar = undefined
+    runtime.pose = undefined
     runtime.model = model
     readyRef.current = false
     // Changing the avatar must not silently discard the phrase that is
@@ -170,8 +209,13 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
       // allowed a switch or reset to display an intermediate bone position.
       resetAvatar(runtime, model)
       readyRef.current = true
+      const queuedPose = pendingPoseRef.current
+      pendingPoseRef.current = null
       const queuedRequest = pendingPhraseRef.current
-      if (queuedRequest) {
+      if (queuedPose) {
+        startPoseRun(queuedPose.clips, runtime, model)
+        onStateChange('signing')
+      } else if (queuedRequest) {
         pendingPhraseRef.current = null
         enqueuePhrase(queuedRequest.phrase, runtime, appendToQueueRef.current)
         onStateChange('signing')
@@ -186,7 +230,20 @@ export function AvatarPlayer({ phrase, requestId, model = 'default', appendToQue
     const animate = (now: number) => {
       animationFrame = requestAnimationFrame(animate)
       const queue = runtime.animations
-      if (runtime.avatar && queue.length && now >= nextFrameAt) {
+      const pose = runtime.pose
+      if (runtime.avatar && pose) {
+        if (pose.start === null) pose.start = now
+        const seconds = ((now - pose.start) / 1000) * speedRef.current
+        const frame = sampleRun(pose.clips, seconds, pose.from, pose.to)
+        for (const [name, bone] of pose.bones) {
+          const q = frame[name]
+          if (q) bone.quaternion.set(q[0], q[1], q[2], q[3])
+        }
+        if (seconds >= pose.duration) {
+          runtime.pose = undefined
+          onStateChange('ready')
+        }
+      } else if (runtime.avatar && queue.length && now >= nextFrameAt) {
         wasSigning = true
         const frame = queue[0]
         for (let index = 0; index < frame.length;) {
@@ -381,6 +438,30 @@ function resetAvatar(runtime: SignRuntime, model: 'default' | 'human') {
   }
   runtime.animations = []
   runtime.characters = []
+}
+
+/**
+ * Start playing avatar tracks. The avatar is first put in its neutral pose (the same one every phrase starts from); the run eases out of it
+ * into the first sign and back into it after the last. Only the bones the tracks drive (arms, hands, fingers, neck, head) are touched.
+ */
+function startPoseRun(clips: PoseClip[], runtime: SignRuntime, model: 'default' | 'human') {
+  const avatar = runtime.avatar
+  if (!avatar) return
+  resetAvatar(runtime, model)
+  const names = new Set<string>()
+  for (const clip of clips) {
+    for (const index of [clip.start, clip.end]) for (const name of Object.keys(clip.track.frames[index].bones)) names.add(name)
+  }
+  const bones: [string, THREE.Object3D][] = []
+  const from: Pose = {}
+  for (const name of names) {
+    const bone = getAvatarBone(avatar, name)
+    if (!bone) continue
+    bones.push([name, bone])
+    const q = bone.quaternion
+    from[name] = [q.x, q.y, q.z, q.w]
+  }
+  runtime.pose = { clips, from, to: { ...from }, start: null, duration: runDuration(clips), bones }
 }
 
 function resolveInstructionForModel(

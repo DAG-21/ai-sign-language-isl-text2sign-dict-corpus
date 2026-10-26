@@ -1,6 +1,7 @@
 import type { ManifestIndex } from './manifest'
 import { fsLetters, isFsToken, normalizeLabel } from './normalize'
-import type { ApprovedMappings, ManifestAsset, ResolveOptions, ResolvedSign } from './types'
+import type { PoseSummary } from './poseGate'
+import type { ApprovedMappings, ManifestAsset, ResolveOptions, ResolvedSign, VideoSign } from './types'
 
 export type ResolverContext = {
   /** Gloss tokens the Yap avatar has a hand-authored animation for (`SUPPORTED_TOKENS`). */
@@ -11,6 +12,11 @@ export type ResolverContext = {
   fileExists?: (asset: ManifestAsset) => boolean
   /** Only auto-select entries a person approved (`verified`). Default false: clean dataset labels (`source_label`) are accepted too. */
   requireReview?: boolean
+  /**
+   * Optional: avatar tracks extracted from the dictionary clips. When a clip has a usable track (it passed the quality gate), the sign resolves as
+   * `islrtc_pose` instead of `islrtc_video`. Absent means every dictionary clip resolves as its video, exactly as before.
+   */
+  pose?: { lookup: (assetId: string) => PoseSummary | null }
 }
 
 type Hit = Exclude<ResolvedSign, { kind: 'fingerspelling' }>
@@ -56,10 +62,10 @@ function lookupKey(key: string, gloss: string, token: string, ctx: ResolverConte
     if (asset && SENSE_STATUSES.has(asset.status) && fileOk(asset, ctx)) {
       const auto = ctx.mappings.auto_default?.[key]
       const isAutoDefault = Boolean(auto && auto[0] === asset.asset_id)
-      return {
-        kind: 'islrtc_video', gloss, token, assetId: asset.asset_id, label: asset.label, variant: asset.variant, reviewed: isReviewed(asset),
+      return dictionarySign(ctx, {
+        gloss, token, assetId: asset.asset_id, label: asset.label, variant: asset.variant, reviewed: isReviewed(asset),
         via: isAutoDefault ? 'default' : 'selected', ...(isAutoDefault ? { alternates: auto!.slice(1) } : {}),
-      }
+      })
     }
     return { kind: 'unresolved', gloss, token, reason: asset ? reasonFor(asset, ctx) : 'no_asset', candidates: selectedId ? [selectedId] : [] }
   }
@@ -80,8 +86,7 @@ function lookupKey(key: string, gloss: string, token: string, ctx: ResolverConte
   }
   const asset = usables[0]
   const exact = (asset.label_norm || normalizeLabel(asset.label)) === lookupKeyName && !aliasTarget
-  return {
-    kind: 'islrtc_video',
+  return dictionarySign(ctx, {
     gloss,
     token,
     assetId: asset.asset_id,
@@ -89,7 +94,13 @@ function lookupKey(key: string, gloss: string, token: string, ctx: ResolverConte
     variant: asset.variant,
     reviewed: isReviewed(asset),
     via: exact ? 'exact' : 'alias',
-  }
+  })
+}
+
+/** A dictionary hit plays as avatar motion when a usable extracted track exists for the clip, otherwise as the recorded video. */
+function dictionarySign(ctx: ResolverContext, fields: Omit<VideoSign, 'kind'>): Hit {
+  const pose = ctx.pose?.lookup(fields.assetId)
+  return pose ? { kind: 'islrtc_pose', ...fields, pose } : { kind: 'islrtc_video', ...fields }
 }
 
 function isReviewed(asset: ManifestAsset): boolean {
@@ -115,7 +126,7 @@ function reasonFor(asset: ManifestAsset, ctx: ResolverContext): 'file_missing' |
 /**
  * Resolve a Phase 1 gloss sequence into playable items, in order.
  *
- * Priority per unit: Yap animation, verified ISLRTC video, fingerspelling
+ * Priority per unit: Yap animation, ISLRTC avatar track (when one passed the quality gate) or else the verified ISLRTC video, fingerspelling
  * (always for `FS:` names; for other words only with `fingerspellUnknown`),
  * then an explicit `unresolved` result. Multiword phrases are tried before
  * single words. Fuzzy matching is deliberately absent.

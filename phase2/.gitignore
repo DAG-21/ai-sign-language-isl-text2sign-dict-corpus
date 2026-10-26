@@ -20,3 +20,13 @@ public/lab/
 
 # on-demand H.264 copies of dictionary clips (derived data)
 .cache/
+
+# manifest and mappings derived from the ISLRTC dictionary (not for redistribution)
+data/islrtc/
+
+# batch landmark/avatar-track output (derived from ISLRTC clips; large, not for redistribution)
+data/pose/
+
+# Python bytecode
+__pycache__/
+*.pyc

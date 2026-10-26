@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { AvatarPlayer } from '@/components/avatar/AvatarPlayer'
 import { parseGlossInput } from '@/lib/sign/input'
+import { loadPoseClips } from '@/lib/sign/poseClient'
+import { runDuration, type PoseClip } from '@/lib/sign/poseTrack'
 import { IDLE, buildSegments, step, type PlaybackEvent, type PlaybackState } from '@/lib/sign/playback'
 import type { ResolvedSign } from '@/lib/sign/types'
 
@@ -16,15 +18,16 @@ type PlanResponse = { plan: ResolvedSign[] }
 /** Small corner tag: where the sign comes from, plus `HI → HELLO` when a synonym stood in for the word. */
 function tagFor(segment: ReturnType<typeof buildSegments>[number]): string {
   if (segment.type === 'unresolved') return ''
-  const base = segment.type === 'video' ? 'dictionary video' : 'avatar'
+  const base = segment.type === 'video' ? 'dictionary video' : segment.type === 'pose' ? 'avatar · motion from dictionary video' : 'avatar'
   const items = segment.type === 'video' ? [segment.item] : segment.items
-  const swaps = items.flatMap((i) => ((i.kind === 'yap_animation' || i.kind === 'islrtc_video') && i.synonym ? [`${i.gloss.replace(/_/g, ' ')} → ${i.synonym.to.toUpperCase().replace(/_/g, ' ')}`] : []))
+  const swaps = items.flatMap((i) => ((i.kind === 'yap_animation' || i.kind === 'islrtc_video' || i.kind === 'islrtc_pose') && i.synonym ? [`${i.gloss.replace(/_/g, ' ')} → ${i.synonym.to.toUpperCase().replace(/_/g, ' ')}`] : []))
   return swaps.length ? `${base} · ${swaps.join(', ')}` : base
 }
 
 /**
  * Minimal demo: one input box (ISL gloss words) and one output box that signs them. Words the avatar knows are signed by the 3D avatar,
- * other dictionary words play as a recorded ISLRTC video, names are fingerspelled. Words with no sign are skipped.
+ * other dictionary words are signed by the avatar from motion extracted from the ISLRTC clip when a quality-checked track exists and otherwise play as
+ * the recorded video, names are fingerspelled. Words with no sign are skipped.
  */
 export function GlossDemo() {
   const [text, setText] = useState('')
@@ -36,6 +39,9 @@ export function GlossDemo() {
   const [avatarPhrase, setAvatarPhrase] = useState('')
   const [requestId, setRequestId] = useState(0)
   const [stopId, setStopId] = useState(0)
+  // Avatar tracks fetched for the current plan, and the run handed to the avatar for the pose segment being played.
+  const poseClips = useRef(new Map<string, PoseClip>())
+  const [poseRun, setPoseRun] = useState<{ runId: number; clips: PoseClip[] } | null>(null)
   const [videoFormat, setVideoFormat] = useState<'original' | 'h264'>('h264')
   // ISLRTC clips are H.265; a browser that cannot decode it is given a cached H.264 copy straight away.
   const [hevcPlayable, setHevcPlayable] = useState(false)
@@ -55,7 +61,7 @@ export function GlossDemo() {
 
   const onAvatarState = useCallback(
     (next: 'loading' | 'ready' | 'signing') => {
-      if (segmentRef.current?.type !== 'avatar') return
+      if (segmentRef.current?.type !== 'avatar' && segmentRef.current?.type !== 'pose') return
       if (next === 'signing') sawSigning.current = true
       else if (next === 'ready' && sawSigning.current) {
         sawSigning.current = false
@@ -83,6 +89,11 @@ export function GlossDemo() {
       setAvatarPhrase(segment.phrase)
       setRequestId((n) => n + 1)
       timer = setTimeout(() => send('failed'), AVATAR_WATCHDOG_MS)
+    } else if (segment.type === 'pose') {
+      const clips = segment.items.flatMap((i) => poseClips.current.get(i.assetId) ?? [])
+      sawSigning.current = false
+      setPoseRun((run) => ({ runId: (run?.runId ?? 0) + 1, clips }))
+      timer = setTimeout(() => send('failed'), Math.max(AVATAR_WATCHDOG_MS, runDuration(clips) * 2000 + 5000))
     } else if (segment.type === 'video') {
       timer = setTimeout(() => send('failed'), VIDEO_WATCHDOG_MS)
     } else {
@@ -103,11 +114,14 @@ export function GlossDemo() {
       const res = await fetch('/api/sign-plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tokens, synonyms: new URLSearchParams(window.location.search).get('synonyms') ?? undefined }) })
       const body = (await res.json()) as PlanResponse & { error?: string }
       if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
-      setPlan(body.plan)
+      // Fetch the avatar tracks first; a sign whose track is unusable goes back to its recorded video.
+      const loaded = await loadPoseClips(body.plan)
+      poseClips.current = loaded.clips
+      setPlan(loaded.plan)
       setAutoStart(true)
       if (!hevcPlayable) {
         // Start the one-off H.264 conversion of the dictionary clips now so playback does not stall on it.
-        const ids = [...new Set(body.plan.flatMap((p) => (p.kind === 'islrtc_video' ? [p.assetId] : [])))]
+        const ids = [...new Set(loaded.plan.flatMap((p) => (p.kind === 'islrtc_video' ? [p.assetId] : [])))]
         void (async () => {
           for (const id of ids) await fetch(`/api/islrtc/${encodeURIComponent(id)}?format=h264`, { headers: { Range: 'bytes=0-0' } }).catch(() => undefined)
         })()
@@ -148,7 +162,7 @@ export function GlossDemo() {
 
       <div className="demo-output" aria-live="polite">
         <div className="demo-avatar" style={{ visibility: segment?.type === 'video' ? 'hidden' : 'visible' }}>
-          <AvatarPlayer phrase={avatarPhrase} requestId={requestId} stopId={stopId} onStateChange={onAvatarState} />
+          <AvatarPlayer phrase={avatarPhrase} requestId={requestId} stopId={stopId} poseRun={poseRun} onStateChange={onAvatarState} />
         </div>
         {segment?.type === 'video' && (
           <video

@@ -5,6 +5,7 @@ import { buildIndex } from '@/lib/sign/manifest'
 import { resolveGloss } from '@/lib/sign/resolver'
 import { summarize } from '@/lib/sign/coverage'
 import { loadSignData, mediaExists } from '@/lib/sign/server'
+import { poseResolverHook } from '@/lib/sign/poseServer'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -34,6 +35,8 @@ export async function POST(request: Request) {
   }
 
   const data = loadSignData()
+  // Avatar tracks extracted from the dictionary clips (quality-gated); absent when none are configured.
+  const pose = poseResolverHook()
   const index = data?.index ?? buildIndex({ schema_version: '1.0', source: 'none', generated_at: '', assets: [] })
   const plan = resolveGloss(
     body.tokens as string[],
@@ -42,11 +45,12 @@ export async function POST(request: Request) {
       index,
       mappings: data?.mappings ?? EMPTY_MAPPINGS,
       fileExists: data ? (asset) => mediaExists(asset, data) : undefined,
+      pose: pose ?? undefined,
     },
     {
       fingerspellUnknown: body.fingerspellUnknown === true,
       synonyms: body.synonyms === 'off' || body.synonyms === 'close' ? body.synonyms : 'exact',
     },
   )
-  return NextResponse.json({ plan, coverage: summarize(plan), dictionaryLoaded: Boolean(data) })
+  return NextResponse.json({ plan, coverage: summarize(plan), dictionaryLoaded: Boolean(data), poseTracksLoaded: Boolean(pose) })
 }

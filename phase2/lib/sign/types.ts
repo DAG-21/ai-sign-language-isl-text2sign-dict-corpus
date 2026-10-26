@@ -77,13 +77,26 @@ export type SynonymUse = { to: string; confidence: SynonymConfidence }
 
 export const EMPTY_MAPPINGS: ApprovedMappings = { select: {}, alias: {}, split: {} }
 
-export type SignSource = 'yap_animation' | 'islrtc_video' | 'fingerspelling' | 'unresolved'
+import type { PoseSummary } from './poseGate'
+
+export type SignSource = 'yap_animation' | 'islrtc_video' | 'islrtc_pose' | 'fingerspelling' | 'unresolved'
 
 export type UnresolvedReason = 'no_asset' | 'ambiguous' | 'not_verified' | 'file_missing' | 'unreadable' | 'empty'
 
+/** A dictionary clip played as the recorded video. */
+export type VideoSign = { kind: 'islrtc_video'; gloss: string; token: string; assetId: string; label: string; variant: string | null; reviewed: boolean; via: 'exact' | 'alias' | 'selected' | 'default'; alternates?: string[]; synonym?: SynonymUse }
+
+/**
+ * The same dictionary clip played as avatar motion extracted from the video (landmarks retargeted to the 3D avatar). It is derived from
+ * the recording and not reviewed by a person, and it is never reported as a hand-authored animation (`yap_animation`) or as the video.
+ * `assetId` is also the video's id, so the player can fall back to the video when the track cannot be loaded.
+ */
+export type PoseSign = Omit<VideoSign, 'kind'> & { kind: 'islrtc_pose'; pose: PoseSummary }
+
 export type ResolvedSign =
   | { kind: 'yap_animation'; gloss: string; token: string; synonym?: SynonymUse }
-  | { kind: 'islrtc_video'; gloss: string; token: string; assetId: string; label: string; variant: string | null; reviewed: boolean; via: 'exact' | 'alias' | 'selected' | 'default'; alternates?: string[]; synonym?: SynonymUse }
+  | VideoSign
+  | PoseSign
   | { kind: 'fingerspelling'; gloss: string; token: string; letters: string[] }
   | { kind: 'unresolved'; gloss: string; token: string; reason: UnresolvedReason; candidates: string[] }
 

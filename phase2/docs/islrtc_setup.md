@@ -83,3 +83,21 @@ This repo has no lint configuration, so there is no lint step.
 The project owner has confirmed the dataset may be used for this project (2026-10-20). For reference, the Hugging Face README (`silentone0725/Indian_Sign_Language_Data.gov_Rencoded`) states MIT for the re-encode of
 ISLRTC's *Indian Sign Language Dictionary (till January 2024)* from data.gov.in, asks users to cite both the original dataset and the re-encode, and asks for ethical use (no surveillance or profiling). I did not independently
 verify the data.gov.in terms. The Y Bot avatar is Mixamo-licensed (`public/models/ATTRIBUTION.md`). The Yap & Render repository itself has no licence file.
+
+## Avatar tracks from the dictionary clips (`islrtc_pose`)
+
+A dictionary clip can be signed by the 3D avatar instead of played as video. `scripts/pose/batch_extract.py` extracts hand and body landmarks from each clip (MediaPipe) and retargets them to the Y Bot rig;
+the result is one `data/pose/tracks/<asset id>.bones.json.gz` per clip, plus `landmarks/<asset id>.npz`, `quality.csv` and `progress.jsonl` (git-ignored: `data/pose/`).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `ISLRTC_POSE_DIR` | Folder holding `pose_index.json` and `tracks/` | `data/pose` |
+
+1. Score the clips and apply the quality gate (hands in at least 30% of frames, shoulders in at least 90%, a signing window). Writes `data/pose/pose_index.json`:
+   `node node_modules/vite-node/vite-node.mjs scripts/build-pose-index.ts -- --dir data/pose` (`--min-hand`, `--min-body` change the thresholds).
+2. `POST /api/sign-plan` now returns `kind: "islrtc_pose"` for a dictionary word whose track passed the gate (otherwise `islrtc_video`, as before). `coverage.bySource.islrtc_pose` and `coverage.poseSequence` count them.
+3. `GET /api/islrtc-pose/<asset id>` serves the gzipped track (`Content-Encoding: gzip`). Only gated ids are served; anything else is 404 and the player falls back to the video.
+4. `AvatarPlayer` takes a `poseRun` prop: it eases from the neutral pose into each sign, blends sign to sign, and eases back. `/demo` uses it.
+
+Without `pose_index.json` nothing changes: every dictionary word resolves as its video. A track that passes the gate is still unreviewed: the gate checks coverage, not that the hand shapes read correctly.
+Known limits: each sign is trimmed to its signing window but not otherwise reviewed; the torso is not driven; the face is used only for head direction; a Yap animation after a track starts from the neutral pose.

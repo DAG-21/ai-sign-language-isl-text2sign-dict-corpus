@@ -5,12 +5,14 @@ import type { ResolvedSign } from './types'
  *
  * Consecutive avatar items (Yap animations and fingerspelling) are merged into
  * one phrase so the existing AvatarPlayer queue plays them exactly as before;
- * dictionary videos and unresolved markers are separate segments. Isolated
+ * dictionary videos and unresolved markers are separate segments. Consecutive avatar tracks (`islrtc_pose`) form one segment so the player can blend
+ * from one sign into the next. Isolated
  * signs played one after another are not continuous, grammatical ISL.
  */
 export type Segment =
   | { type: 'avatar'; phrase: string; items: ResolvedSign[] }
   | { type: 'video'; item: Extract<ResolvedSign, { kind: 'islrtc_video' }> }
+  | { type: 'pose'; items: Extract<ResolvedSign, { kind: 'islrtc_pose' }>[] }
   | { type: 'unresolved'; item: Extract<ResolvedSign, { kind: 'unresolved' }> }
 
 export function buildSegments(plan: readonly ResolvedSign[]): Segment[] {
@@ -18,6 +20,10 @@ export function buildSegments(plan: readonly ResolvedSign[]): Segment[] {
   for (const item of plan) {
     if (item.kind === 'islrtc_video') {
       segments.push({ type: 'video', item })
+    } else if (item.kind === 'islrtc_pose') {
+      const last = segments[segments.length - 1]
+      if (last?.type === 'pose') last.items.push(item)
+      else segments.push({ type: 'pose', items: [item] })
     } else if (item.kind === 'unresolved') {
       segments.push({ type: 'unresolved', item })
     } else {
