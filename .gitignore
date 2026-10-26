@@ -1,0 +1,17 @@
+# Safety net for the whole repository; each phase also has its own .gitignore.
+node_modules/
+.next/
+.venv/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.DS_Store
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# local tool settings
+.claude/
+skills-lock.json
