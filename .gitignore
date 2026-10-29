@@ -15,3 +15,6 @@ __pycache__/
 # local tool settings
 .claude/
 skills-lock.json
+
+# Python build metadata
+*.egg-info/
